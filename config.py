@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -19,6 +23,20 @@ class ConfigError(RuntimeError):
 
 _TRUE = {"1", "true", "yes", "on", "y"}
 _FALSE = {"0", "false", "no", "off", "n"}
+
+# 会话密钥里出现这些值说明是「照抄示例 / 随手写的」，生产模式下一律拒绝启动。
+# 默认密钥可预测意味着任何人都能伪造管理员会话，比默认口令更危险。
+_PLACEHOLDER_SECRETS = {
+    "dev-only-insecure-key",
+    "please-change-me",
+    "change-me",
+    "changeme",
+    "secret",
+    "secret-key",
+    "test-secret",
+}
+_SECRET_MIN_LENGTH = 16
+_SECRET_FILE_NAME = ".secret_key"
 
 
 def _env_str(key: str, default: str) -> str:
@@ -69,6 +87,79 @@ def _env_bool(key: str, default: bool) -> bool:
     raise ConfigError(f"{key} 必须是布尔值（true/false），当前值 {raw!r}")
 
 
+def _env_list(key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """逗号分隔的列表型环境变量（如代理白名单）。"""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    items = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return items or default
+
+
+# ---------------------------------------------------------------- 会话密钥
+
+
+def secret_file_path(db_path: str) -> Path:
+    """密钥的落盘位置：与数据库同目录，便于随数据一起迁移/备份。"""
+    return Path(db_path).expanduser().parent / _SECRET_FILE_NAME
+
+
+def _load_or_create_secret_key(db_path: str) -> str:
+    """未显式配置密钥时：生成一个随机密钥并持久化。
+
+    这样既保留「开箱即用」，又让每套部署的会话密钥互不相同且不可预测。
+    文件权限收紧到仅所有者可读写（Windows 上 chmod 语义有限，但不影响功能）。
+    """
+    path = secret_file_path(db_path)
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    except OSError as exc:
+        raise ConfigError(f"无法读取会话密钥文件 {path}：{exc}") from exc
+    if existing:
+        return existing
+
+    key = secrets.token_urlsafe(48)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(key + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"无法写入会话密钥文件 {path}：{exc}") from exc
+    logger.warning(
+        "未配置 LIBRARY_SECRET_KEY，已自动生成会话密钥并保存到 %s（请勿提交到版本库）",
+        path,
+    )
+    return key
+
+
+def _resolve_secret_key(db_path: str, *, debug: bool) -> str:
+    """决定会话密钥：显式配置优先，否则自动生成并落盘。
+
+    生产模式（LIBRARY_DEBUG=false）下拒绝示例值 / 过短的值 —— 这类密钥
+    可被用来伪造会话直接冒充管理员，绕过口令校验。
+    """
+    raw = (os.getenv("LIBRARY_SECRET_KEY") or "").strip()
+    if not raw:
+        return _load_or_create_secret_key(db_path)
+
+    placeholder = raw.lower() in _PLACEHOLDER_SECRETS
+    too_short = len(raw) < _SECRET_MIN_LENGTH
+    if debug:
+        if placeholder or too_short:
+            logger.warning("LIBRARY_SECRET_KEY 是示例值或过短，仅开发模式（debug）允许使用")
+        return raw
+    if placeholder:
+        raise ConfigError(
+            "LIBRARY_SECRET_KEY 仍是示例值，生产模式下禁止使用（该密钥可被用来伪造管理员会话）；"
+            "请改成随机字符串，或清空该变量以自动生成并保存到 .secret_key"
+        )
+    if too_short:
+        raise ConfigError(f"LIBRARY_SECRET_KEY 至少需要 {_SECRET_MIN_LENGTH} 个字符，当前 {len(raw)} 个")
+    return raw
+
+
 @dataclass(frozen=True)
 class Config:
     """运行时配置快照。"""
@@ -93,23 +184,33 @@ class Config:
     login_max_attempts: int = 5
     login_lock_minutes: int = 5
     cookie_secure: bool = False
+    # 罚金封顶（每笔借阅）：0 表示不限制
+    # fine_max_days 限制最长计息天数，fine_cap 限制单笔罚金金额，两者取先到者
+    fine_max_days: int = 365
+    fine_cap: float = 50.0
+    # 受信反向代理（IP 或 CIDR）：只有这些来源的 X-Forwarded-For 才被采信
+    trusted_proxies: tuple[str, ...] = ()
 
 
 def load_config() -> Config:
     db_path = _env_str("LIBRARY_DB_PATH", str(BASE_DIR / "data" / "library.db"))
+    debug = _env_bool("LIBRARY_DEBUG", False)
     return Config(
         db_path=db_path,
         host=_env_str("LIBRARY_HOST", "127.0.0.1"),
         port=_env_int("LIBRARY_PORT", 8000, minimum=1, maximum=65535),
-        debug=_env_bool("LIBRARY_DEBUG", False),
+        debug=debug,
         # 业务参数
         loan_days=_env_int("LIBRARY_LOAN_DAYS", 30, minimum=1, maximum=365),
         max_renew=_env_int("LIBRARY_MAX_RENEW", 2, minimum=0, maximum=10),
         fine_per_day=_env_float("LIBRARY_FINE_PER_DAY", 0.50, minimum=0),
+        # 罚金封顶：max_days = 0 / cap = 0 均表示该维度不限制
+        fine_max_days=_env_int("LIBRARY_FINE_MAX_DAYS", 365, minimum=0, maximum=3650),
+        fine_cap=_env_float("LIBRARY_FINE_CAP", 50.0, minimum=0),
         default_max_borrow=_env_int("LIBRARY_DEFAULT_MAX_BORROW", 5, minimum=1, maximum=50),
         # 可观测性 / 安全
         log_level=_env_str("LIBRARY_LOG_LEVEL", "INFO").upper(),
-        secret_key=_env_str("LIBRARY_SECRET_KEY", "dev-only-insecure-key"),
+        secret_key=_resolve_secret_key(db_path, debug=debug),
         # 站点信息
         library_name=_env_str("LIBRARY_NAME", "星海图书馆"),
         library_slogan=_env_str("LIBRARY_SLOGAN", "让每一本书都找到它的读者"),
@@ -120,6 +221,7 @@ def load_config() -> Config:
         login_max_attempts=_env_int("LIBRARY_LOGIN_MAX_ATTEMPTS", 5, minimum=1, maximum=100),
         login_lock_minutes=_env_int("LIBRARY_LOGIN_LOCK_MINUTES", 5, minimum=1, maximum=1440),
         cookie_secure=_env_bool("LIBRARY_COOKIE_SECURE", False),
+        trusted_proxies=_env_list("LIBRARY_TRUSTED_PROXIES"),
     )
 
 

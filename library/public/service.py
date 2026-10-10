@@ -41,6 +41,8 @@ def overview() -> dict[str, Any]:
             "loan_days": cfg.loan_days,
             "max_renew": cfg.max_renew,
             "fine_per_day": cfg.fine_per_day,
+            "fine_max_days": cfg.fine_max_days,
+            "fine_cap": cfg.fine_cap,
             "max_borrow": cfg.default_max_borrow,
         },
         "categories": repo.categories(),

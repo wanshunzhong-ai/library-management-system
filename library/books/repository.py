@@ -11,6 +11,22 @@ _COLUMNS = (
     "location, description, total_copies, available_copies, created_at, updated_at"
 )
 
+# 允许前端排序的列（对外键 → 列表达式白名单）。表达式全部来自这里，
+# 用户传来的 sort/order 只用于查表与二选一，不会进入 SQL 文本。
+_SORT_COLUMNS = {
+    "id": "id",
+    "title": "title COLLATE NOCASE",
+    "author": "author COLLATE NOCASE",
+    "publisher": "publisher COLLATE NOCASE",
+    "category": "category COLLATE NOCASE",
+    "publish_year": "COALESCE(publish_year, 0)",
+    "total_copies": "total_copies",
+    "available_copies": "available_copies",
+    "created_at": "created_at",
+    "updated_at": "updated_at",
+}
+_DEFAULT_ORDER = "id DESC"
+
 
 def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
@@ -43,10 +59,8 @@ def count(filters: Mapping[str, Any]) -> int:
 
 def list_books(filters: Mapping[str, Any], *, limit: int, offset: int) -> list[dict[str, Any]]:
     where, params = _build_filters(filters)
-    sql = (
-        f"SELECT {_COLUMNS} FROM books{where} "
-        "ORDER BY id DESC LIMIT ? OFFSET ?"
-    )
+    order = db.order_clause(filters, _SORT_COLUMNS, _DEFAULT_ORDER)
+    sql = f"SELECT {_COLUMNS} FROM books{where} ORDER BY {order} LIMIT ? OFFSET ?"
     return db.query_all(sql, [*params, limit, offset])
 
 
@@ -105,6 +119,23 @@ def set_barcode(book_id: int, code: str) -> None:
         "UPDATE books SET barcode = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
         [code, book_id],
     )
+
+
+def update_copies(book_id: int, total_copies: int, available_copies: int) -> int:
+    """调整总册数与可借数（上下架 / 调库），返回命中行数。
+
+    只发一条 UPDATE、不开自己的事务：调用方（``books/service.set_total_copies``）
+    需要在同一个 IMMEDIATE 事务里先校验在借数再写入，避免与借书/还书并发时算错库存。
+    """
+    cur = db.get_conn().execute(
+        "UPDATE books SET total_copies = ?, available_copies = ?, "
+        "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [total_copies, available_copies, book_id],
+    )
+    try:
+        return max(0, int(cur.rowcount or 0))
+    finally:
+        cur.close()
 
 
 def fill_description_if_empty(isbn: str, description: str) -> int:

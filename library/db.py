@@ -7,7 +7,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from config import get_config
 from library.barcode import generate
@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS books (
     location         TEXT    NOT NULL DEFAULT '',
     description      TEXT    NOT NULL DEFAULT '',
     total_copies     INTEGER NOT NULL DEFAULT 1 CHECK (total_copies >= 0),
-    available_copies INTEGER NOT NULL DEFAULT 1 CHECK (available_copies >= 0),
+    -- 可借数不得为负、也不得超过总册数（后者是并发还书重复回补的兜底）
+    available_copies INTEGER NOT NULL DEFAULT 1
+                     CHECK (available_copies >= 0 AND available_copies <= total_copies),
     created_at       TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at       TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -132,9 +134,17 @@ def close_conn(exc: BaseException | None = None) -> None:
 
 
 @contextmanager
-def transaction() -> Iterator[sqlite3.Connection]:
-    """显式事务：成功提交，异常回滚。用于借书/还书这类多表联动写操作。"""
+def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """显式事务：成功提交，异常回滚。用于借书/还书这类多表联动写操作。
+
+    ``immediate=True`` 使用 ``BEGIN IMMEDIATE``：事务开始即取写锁，把并发写请求
+    串行化。默认的 deferred 事务只有在首次写入时才取锁，事务内的 SELECT 仍读旧快照，
+    「先查后写」的校验（借阅上限、重复借、续借次数）会被并发绕过 —— 凡是有
+    「读-判断-写」语义的借阅写路径都必须用 immediate。
+    """
     conn = get_conn()
+    if immediate and not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -183,6 +193,23 @@ def executemany(sql: str, seq: Iterable[Sequence[Any]]) -> None:
         conn.executemany(sql, seq)
 
 
+def order_clause(
+    filters: Mapping[str, Any], columns: Mapping[str, str], default: str
+) -> str:
+    """把 ``sort`` / ``order`` 查询参数解析成安全的 ORDER BY 片段。
+
+    ``columns`` 是「对外排序键 → 真实列表达式」的白名单，未命中或方向非法时
+    回落到 ``default``。拼进 SQL 的字符串只来自代码里的常量映射，
+    用户输入仅用于查字典与二选一，因此不存在拼接注入面。
+    """
+    key = str(filters.get("sort") or "").strip().lower()
+    column = columns.get(key)
+    if not column:
+        return default
+    direction = "ASC" if str(filters.get("order") or "").strip().lower() == "asc" else "DESC"
+    return f"{column} {direction}"
+
+
 def init_db() -> None:
     """建表 + 建索引 + 增量迁移（幂等）。"""
     conn = get_conn()
@@ -207,6 +234,20 @@ _BARCODE_INDEX_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_books_barcode ON books(barcode) WHERE barcode <> ''"
 )
 
+# 同一读者对同一本书只能有一条「未归还」记录。
+# 应用层已有校验，这里是数据库层兜底，防止并发写入产生重复在借。
+_LOANS_OPEN_UNIQUE_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_loans_open_unique "
+    "ON loans(book_id, member_id) WHERE returned_at IS NULL"
+)
+
+# 手机号与证号一样是登录账号，必须全局唯一（空串代表未填，不参与约束）。
+# 应用层校验之外再加数据库兜底，避免并发建档写入重复手机号后身份归属不明。
+_MEMBERS_PHONE_UNIQUE_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_phone_unique "
+    "ON members(phone) WHERE phone <> ''"
+)
+
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -227,6 +268,177 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     _backfill_barcodes(conn)
     conn.execute(_BARCODE_INDEX_SQL)
+    _repair_inventory(conn)
+    _create_open_loan_index(conn)
+    _create_member_phone_index(conn)
+
+
+def _repair_inventory(conn: sqlite3.Connection) -> None:
+    """把越界的可借数夹回合法区间（幂等）。
+
+    历史版本在并发还书时可能重复回补库存，导致 ``available_copies > total_copies``；
+    老库无法通过 ALTER 补上 CHECK 约束，因此这里做一次性数据修复。
+    """
+    over = conn.execute(
+        "UPDATE books SET available_copies = total_copies WHERE available_copies > total_copies"
+    )
+    under = conn.execute("UPDATE books SET available_copies = 0 WHERE available_copies < 0")
+    fixed = int(over.rowcount or 0) + int(under.rowcount or 0)
+    if fixed:
+        logger.warning(
+            "库存越界数据已修复",
+            extra={"extra_fields": {"fixed_rows": fixed}},
+        )
+
+
+def _create_open_loan_index(conn: sqlite3.Connection) -> None:
+    """创建「同一读者同一本书只能有一条未归还记录」的唯一索引。
+
+    老库若已存在重复在借数据，建索引会失败：此时记警告并跳过，
+    不自动改写借阅记录（由 check_consistency() 报告，交人工处理）。
+    """
+    try:
+        conn.execute(_LOANS_OPEN_UNIQUE_SQL)
+    except sqlite3.IntegrityError as exc:
+        logger.warning(
+            "存在重复在借记录，未能创建唯一索引 idx_loans_open_unique：%s；"
+            "请先用 check_consistency() 排查",
+            exc,
+        )
+
+
+def _create_member_phone_index(conn: sqlite3.Connection) -> None:
+    """创建手机号唯一索引（空串不参与）。
+
+    老库若已有重复手机号，建索引会失败：记警告并跳过，不自动清空任何人的
+    联系方式（那是丢数据），由 check_consistency() 报告后交人工处理。
+    """
+    try:
+        conn.execute(_MEMBERS_PHONE_UNIQUE_SQL)
+    except sqlite3.IntegrityError as exc:
+        logger.warning(
+            "存在重复手机号，未能创建唯一索引 idx_members_phone_unique：%s；"
+            "请先用 check_consistency() 排查",
+            exc,
+        )
+
+
+def check_consistency() -> dict[str, Any]:
+    """数据一致性自检：库存越界、重复在借、库存总量与在借数是否对得上。
+
+    返回 ``{"ok": bool, "issues": [...]}``，可用于运维巡检与测试断言。
+    """
+    issues: list[dict[str, Any]] = []
+
+    for row in query_all(
+        "SELECT id, title, total_copies, available_copies FROM books "
+        " WHERE available_copies < 0 OR available_copies > total_copies"
+    ):
+        issues.append({"type": "inventory_out_of_range", **row})
+
+    for row in query_all(
+        "SELECT book_id, member_id, COUNT(*) AS duplicates FROM loans "
+        " WHERE returned_at IS NULL GROUP BY book_id, member_id HAVING duplicates > 1"
+    ):
+        issues.append({"type": "duplicate_open_loan", **row})
+
+    for row in query_all(
+        "SELECT phone, COUNT(*) AS duplicates FROM members "
+        " WHERE phone <> '' GROUP BY phone HAVING duplicates > 1"
+    ):
+        issues.append({"type": "duplicate_member_phone", **row})
+
+    for row in query_all(
+        "SELECT m.id AS member_id, m.card_no, m.phone, x.id AS other_member_id "
+        "  FROM members m JOIN members x ON x.card_no = m.phone AND x.id <> m.id "
+        " WHERE m.phone <> ''"
+    ):
+        issues.append({"type": "phone_shadows_card_no", **row})
+
+    for row in query_all(
+        "SELECT m.id AS member_id, m.card_no, m.phone, a.username "
+        "  FROM members m JOIN admins a "
+        "    ON a.username = m.card_no OR (m.phone <> '' AND a.username = m.phone)"
+    ):
+        issues.append({"type": "member_identifier_shadows_admin", **row})
+
+    summary = query_one(
+        "SELECT (SELECT COALESCE(SUM(total_copies), 0)     FROM books) AS total_copies,"
+        "       (SELECT COALESCE(SUM(available_copies), 0) FROM books) AS available_copies,"
+        "       (SELECT COUNT(*) FROM loans WHERE returned_at IS NULL) AS open_loans"
+    ) or {}
+    total_copies = int(summary.get("total_copies") or 0)
+    available_copies = int(summary.get("available_copies") or 0)
+    open_loans = int(summary.get("open_loans") or 0)
+    if available_copies != total_copies - open_loans:
+        issues.append(
+            {
+                "type": "inventory_mismatch",
+                "available_copies": available_copies,
+                "expected": total_copies - open_loans,
+            }
+        )
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "total_copies": total_copies,
+        "available_copies": available_copies,
+        "open_loans": open_loans,
+    }
+
+
+def repair_consistency() -> dict[str, Any]:
+    """修复有明确正确答案的数据问题：同一读者同一本书的重复在借记录。
+
+    保留最早的一条，把多余的标记为已归还（归还时间取其应还日期），并把因此
+    多出来的那一册补回可借数——账实依旧对得上。只碰这一种情况，其余问题
+    （例如重复手机号）一律留给人工判断，避免误改真实数据。
+
+    返回 ``{"closed_loans": n, "before": ..., "after": ...}``。
+    """
+    before = check_consistency()
+    closed = 0
+    with transaction(immediate=True) as conn:
+        groups = conn.execute(
+            "SELECT book_id, member_id FROM loans "
+            " WHERE returned_at IS NULL GROUP BY book_id, member_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        for book_id, member_id in groups:
+            duplicates = conn.execute(
+                "SELECT id, due_at FROM loans WHERE book_id = ? AND member_id = ? "
+                "  AND returned_at IS NULL ORDER BY id",
+                [book_id, member_id],
+            ).fetchall()
+            for loan_id, due_at in duplicates[1:]:
+                conn.execute(
+                    "UPDATE loans SET returned_at = ? WHERE id = ? AND returned_at IS NULL",
+                    [due_at or _now_str(), loan_id],
+                )
+                conn.execute(
+                    "UPDATE books SET available_copies = MIN(total_copies, available_copies + 1), "
+                    "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+                    [book_id],
+                )
+                closed += 1
+
+    if closed:
+        # 数据干净了，把当初建不上的唯一索引补上
+        conn = get_conn()
+        _create_open_loan_index(conn)
+        conn.commit()
+        logger.warning(
+            "已修复重复在借记录",
+            extra={"extra_fields": {"closed_loans": closed}},
+        )
+    after = check_consistency()
+    return {"closed_loans": closed, "before": before, "after": after}
+
+
+def _now_str() -> str:
+    from library import timeutil
+
+    return timeutil.to_str(timeutil.now())
 
 
 def _backfill_barcodes(conn: sqlite3.Connection) -> None:

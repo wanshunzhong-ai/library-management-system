@@ -24,6 +24,12 @@ def borrow():
     return jsonify(service.borrow(request.get_json(silent=True) or {})), 201
 
 
+@bp.post("/return-batch")
+def return_batch():
+    """批量还书：一次归还多册，逐条返回结果（部分失败不影响其余）。"""
+    return jsonify(service.return_batch(request.get_json(silent=True) or {}))
+
+
 @bp.post("/<int:loan_id>/return")
 def return_book(loan_id: int):
     return jsonify(service.return_book(loan_id))

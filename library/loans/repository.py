@@ -16,22 +16,51 @@ SELECT l.id, l.book_id, l.member_id, l.borrowed_at, l.due_at, l.returned_at,
        b.category   AS book_category,
        m.card_no    AS member_card,
        m.name       AS member_name,
-       m.phone      AS member_phone
+       m.phone      AS member_phone,
+       m.status     AS member_status
   FROM loans l
   JOIN books   b ON b.id = l.book_id
   JOIN members m ON m.id = l.member_id
 """
+
+# 允许前端排序的列（对外键 → 列表达式白名单）。
+# 状态与罚金是派生字段，这里用与之等价的 SQL 表达式排序：
+#   状态序：逾期(0) → 在借(1) → 已归还(2)
+#   罚金序：与「逾期天数」同序（应还与归还/今天的整日差，逾期为 0）
+_OVERDUE_DAYS_SQL = (
+    "CASE WHEN l.returned_at IS NULL "
+    "     THEN MAX(0, CAST(julianday(date('now', 'localtime')) - julianday(date(l.due_at)) AS INTEGER)) "
+    "     ELSE MAX(0, CAST(julianday(date(l.returned_at)) - julianday(date(l.due_at)) AS INTEGER)) END"
+)
+_SORT_COLUMNS = {
+    "id": "l.id",
+    "book_title": "b.title COLLATE NOCASE",
+    "member_name": "m.name COLLATE NOCASE",
+    "borrowed_at": "l.borrowed_at",
+    "due_at": "l.due_at",
+    "returned_at": "l.returned_at",
+    "renew_count": "l.renew_count",
+    "status": (
+        "CASE WHEN l.returned_at IS NOT NULL THEN 2 "
+        "     WHEN date(l.due_at) < date('now', 'localtime') THEN 0 ELSE 1 END"
+    ),
+    "fine": _OVERDUE_DAYS_SQL,
+}
+# 默认：未归还优先，其次按应还日期升序（最先到期的排前面），最后按 id 兜底稳定排序
+_DEFAULT_ORDER = "(l.returned_at IS NULL) DESC, l.due_at ASC, l.id DESC"
 
 
 def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
 
+    # 逾期判定统一走「整日」口径（date 相减），与 service 层状态/天数算法一致：
+    # 应还当天（无论时刻是否已过）都不算逾期，不会出现「逾期 0 天」。
     status = (filters.get("status") or "").strip()
     if status == "borrowed":
-        clauses.append("l.returned_at IS NULL AND l.due_at >= datetime('now', 'localtime')")
+        clauses.append("l.returned_at IS NULL AND date(l.due_at) >= date('now', 'localtime')")
     elif status == "overdue":
-        clauses.append("l.returned_at IS NULL AND l.due_at < datetime('now', 'localtime')")
+        clauses.append("l.returned_at IS NULL AND date(l.due_at) < date('now', 'localtime')")
     elif status == "returned":
         clauses.append("l.returned_at IS NOT NULL")
     elif status == "open":
@@ -65,11 +94,8 @@ def count(filters: Mapping[str, Any]) -> int:
 
 def list_loans(filters: Mapping[str, Any], *, limit: int, offset: int) -> list[dict[str, Any]]:
     where, params = _build_filters(filters)
-    sql = (
-        _SELECT
-        + where
-        + " ORDER BY (l.returned_at IS NULL) DESC, l.due_at ASC, l.id DESC LIMIT ? OFFSET ?"
-    )
+    order = db.order_clause(filters, _SORT_COLUMNS, _DEFAULT_ORDER)
+    sql = _SELECT + where + f" ORDER BY {order} LIMIT ? OFFSET ?"
     return db.query_all(sql, [*params, limit, offset])
 
 
@@ -93,10 +119,11 @@ def recent(limit: int = 8) -> list[dict[str, Any]]:
 
 
 def due_soon(days: int = 7, limit: int = 8) -> list[dict[str, Any]]:
+    """今天起 N 天内到期（整日口径，含「今天到期」，与逾期判定不重叠）。"""
     return db.query_all(
         _SELECT
-        + " WHERE l.returned_at IS NULL AND l.due_at >= datetime('now', 'localtime')"
-          "   AND l.due_at < datetime('now', 'localtime', ?) "
+        + " WHERE l.returned_at IS NULL AND date(l.due_at) >= date('now', 'localtime')"
+          "   AND date(l.due_at) <= date('now', 'localtime', ?) "
           " ORDER BY l.due_at ASC LIMIT ?",
         [f"+{int(days)} days", limit],
     )
@@ -105,9 +132,16 @@ def due_soon(days: int = 7, limit: int = 8) -> list[dict[str, Any]]:
 def overdue_list(limit: int = 20) -> list[dict[str, Any]]:
     return db.query_all(
         _SELECT
-        + " WHERE l.returned_at IS NULL AND l.due_at < datetime('now', 'localtime')"
+        + " WHERE l.returned_at IS NULL AND date(l.due_at) < date('now', 'localtime')"
           " ORDER BY l.due_at ASC LIMIT ?",
         [limit],
+    )
+
+
+def open_loan_settlements() -> list[dict[str, Any]]:
+    """所有未归还记录（供概览按统一口径估算罚金）。"""
+    return db.query_all(
+        "SELECT due_at, returned_at FROM loans WHERE returned_at IS NULL"
     )
 
 

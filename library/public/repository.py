@@ -13,7 +13,8 @@ _PUBLIC_COLUMNS = (
 
 
 def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
+    # 下架图书（总册数为 0）不入读者检索结果，等同「已从架上移除」
+    clauses: list[str] = ["total_copies > 0"]
     params: list[Any] = []
 
     keyword = (filters.get("keyword") or "").strip()
@@ -60,13 +61,15 @@ def stats() -> dict[str, Any]:
                COUNT(DISTINCT category)                   AS category_count,
                COALESCE(SUM(CASE WHEN available_copies > 0 THEN 1 ELSE 0 END), 0) AS borrowable_titles
           FROM books
+         WHERE total_copies > 0
         """
     ) or {}
 
 
 def new_arrivals(limit: int = 6) -> list[dict[str, Any]]:
     return db.query_all(
-        f"SELECT {_PUBLIC_COLUMNS} FROM books ORDER BY id DESC LIMIT ?", [limit]
+        f"SELECT {_PUBLIC_COLUMNS} FROM books WHERE total_copies > 0 ORDER BY id DESC LIMIT ?",
+        [limit],
     )
 
 
@@ -92,7 +95,7 @@ def categories(limit: int = 12) -> list[dict[str, Any]]:
     return db.query_all(
         "SELECT category AS name, COUNT(*) AS book_count, "
         "       COALESCE(SUM(available_copies), 0) AS available_copies "
-        "FROM books GROUP BY category "
+        "FROM books WHERE total_copies > 0 GROUP BY category "
         "ORDER BY COALESCE(SUM(available_copies), 0) DESC, book_count DESC, name ASC LIMIT ?",
         [limit],
     )

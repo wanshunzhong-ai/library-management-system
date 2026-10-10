@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from config import get_config
 from library import db
+from library.auth import repository as auth_repo
 from library.auth.passwords import hash_password, initial_password
 from library.errors import BusinessRuleError, ConflictError, NotFoundError
 from library.members import repository as repo
@@ -25,6 +26,36 @@ MEMBER_TYPES = {"学生", "教师", "社会", "VIP"}
 MEMBER_STATUS = {"active", "frozen"}
 
 
+def ensure_identifier_available(
+    value: str,
+    *,
+    field: str,
+    label: str,
+    exclude_member_id: int | None = None,
+) -> None:
+    """校验「证号 / 手机号」这个登录标识是否可用。
+
+    证号与手机号都能当登录账号，因此必须**全局唯一**，且不能与后台管理员的
+    用户名重名——否则统一登录入口识别身份时会互相遮蔽（管理员先匹配，
+    读者将永远登不进来；反过来手机号撞上别人的证号则会登进他人账户）。
+    管理员建档、管理员改档、读者自助改手机号三条路径共用本函数。
+    """
+    key = (value or "").strip()
+    if not key:
+        return
+    if auth_repo.exists_username(key):
+        raise ConflictError(
+            f"{label} {key} 与后台管理员的登录账号重名，请更换",
+            details={"field": field},
+        )
+    conflict = repo.find_conflicting_identifier(key, exclude_id=exclude_member_id)
+    if conflict is not None:
+        raise ConflictError(
+            f"{label} {key} 已被读者「{conflict['name']}」占用（证号 {conflict['card_no']}），请更换",
+            details={"field": field},
+        )
+
+
 def _normalize(payload: Mapping[str, Any], *, default_max_borrow: int) -> dict[str, Any]:
     return {
         "card_no": require_str(payload, "card_no", label="读者证号", max_length=32),
@@ -41,7 +72,13 @@ def _normalize(payload: Mapping[str, Any], *, default_max_borrow: int) -> dict[s
 
 def list_members(query: Mapping[str, Any]) -> dict[str, Any]:
     page, size = pagination(query)
-    filters = {"keyword": query.get("keyword", ""), "status": query.get("status", "")}
+    filters = {
+        "keyword": query.get("keyword", ""),
+        "status": query.get("status", ""),
+        # 排序：未命中白名单时由仓库层回落到默认顺序
+        "sort": query.get("sort", ""),
+        "order": query.get("order", ""),
+    }
     total = repo.count(filters)
     items = repo.list_members(filters, limit=size, offset=(page - 1) * size)
     return {
@@ -66,6 +103,8 @@ def create_member(payload: Mapping[str, Any]) -> dict[str, Any]:
     data = _normalize(payload, default_max_borrow=get_config().default_max_borrow)
     if repo.exists_card(data["card_no"]):
         raise ConflictError(f"读者证号 {data['card_no']} 已存在", details={"field": "card_no"})
+    ensure_identifier_available(data["card_no"], field="card_no", label="读者证号")
+    ensure_identifier_available(data["phone"], field="phone", label="手机号")
 
     # 新建读者即开通门户账号，初始密码为证号后 6 位
     plain_password = initial_password(data["card_no"])
@@ -115,6 +154,12 @@ def update_member(member_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
     data = _normalize(payload, default_max_borrow=get_config().default_max_borrow)
     if repo.exists_card(data["card_no"], exclude_id=member_id):
         raise ConflictError(f"读者证号 {data['card_no']} 已被占用", details={"field": "card_no"})
+    ensure_identifier_available(
+        data["card_no"], field="card_no", label="读者证号", exclude_member_id=member_id
+    )
+    ensure_identifier_available(
+        data["phone"], field="phone", label="手机号", exclude_member_id=member_id
+    )
 
     active = repo.active_loan_count(member_id)
     if data["status"] == "frozen" and active:

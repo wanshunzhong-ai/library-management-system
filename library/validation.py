@@ -119,3 +119,28 @@ def pagination(payload: Mapping[str, Any], *, default_size: int = 10, max_size: 
 def normalize_isbn(raw: str) -> str:
     """去掉分隔符并转大写，做唯一性判定用。"""
     return re.sub(r"[^0-9Xx]", "", raw).upper()
+
+
+def isbn_check(raw: str) -> str:
+    """按校验位判断 ISBN 是否规范，仅用于**提示**而不阻断保存。
+
+    返回 ``ok`` / ``invalid_checksum``（长度合法但校验位不对）/ ``unknown_format``
+    （长度不是 10 或 13 位，无从判断）。不少馆藏沿用内部编码或旧书号，
+    因此这里只做提示，避免把历史数据挡在门外。
+    """
+    code = normalize_isbn(raw)
+    if len(code) == 13:
+        if not code.isdigit():
+            return "unknown_format"
+        total = sum((1 if i % 2 == 0 else 3) * int(d) for i, d in enumerate(code[:12]))
+        expected = (10 - total % 10) % 10
+        return "ok" if expected == int(code[12]) else "invalid_checksum"
+
+    if len(code) == 10:
+        if not (code[:9].isdigit() and (code[9].isdigit() or code[9] == "X")):
+            return "unknown_format"
+        # 权重 10..1，X 计作 10；合法 ISBN-10 的加权和应能被 11 整除
+        total = sum((10 - i) * (10 if ch == "X" else int(ch)) for i, ch in enumerate(code))
+        return "ok" if total % 11 == 0 else "invalid_checksum"
+
+    return "unknown_format"

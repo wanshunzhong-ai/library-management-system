@@ -86,17 +86,48 @@
 
   /* ---------------- 提示 ---------------- */
 
-  function toast(title, body, kind) {
+  function toast(title, body, kind, action) {
     const layer = $("#toastLayer");
     const node = document.createElement("div");
     node.className = "toast " + (kind || "");
-    node.innerHTML = `<div class="t-title">${esc(title)}</div>` + (body ? `<div class="t-body">${esc(body)}</div>` : "");
+    node.setAttribute("role", kind === "error" ? "alert" : "status");
+    node.innerHTML =
+      '<button class="t-close" type="button" aria-label="关闭提示">✕</button>' +
+      `<div class="t-title">${esc(title)}</div>` +
+      (body ? `<div class="t-body">${esc(body)}</div>` : "");
     layer.appendChild(node);
-    setTimeout(() => node.remove(), 4200);
+
+    if (action && action.label && typeof action.onClick === "function") {
+      const btn = document.createElement("button");
+      btn.className = "btn sm t-action";
+      btn.type = "button";
+      btn.textContent = action.label;
+      btn.addEventListener("click", () => { action.onClick(); node.remove(); });
+      node.appendChild(btn);
+    }
+
+    const wait = kind === "error" ? 6000 : 3600;
+    let timer = setTimeout(dismiss, wait);
+    function dismiss() {
+      clearTimeout(timer);
+      node.classList.add("out");
+      setTimeout(() => node.remove(), 220);
+    }
+    node.querySelector(".t-close").addEventListener("click", dismiss);
+    // 悬停暂停自动关闭
+    node.addEventListener("mouseenter", () => clearTimeout(timer));
+    node.addEventListener("mouseleave", () => { timer = setTimeout(dismiss, wait); });
   }
 
   function showError(err) {
     if (err && err.code === "unauthorized") return;
+    if (err && err.code === "csrf_failed") {
+      toast("页面会话已过期", "继续重试不会成功，请刷新页面后再操作。", "error", {
+        label: "立即刷新",
+        onClick: () => location.reload(),
+      });
+      return;
+    }
     toast("操作失败", (err && err.message) || "未知错误", "error");
   }
 
@@ -162,9 +193,11 @@
   }
 
   function renderRules(rules) {
+    const cap = Number(rules.fine_cap) || 0;
+    const capNote = cap > 0 ? `（单笔封顶 <b>${money(cap)}</b>）` : "";
     $("#rulesNote").innerHTML =
       `借期 <b>${rules.loan_days}</b> 天 · 最多续借 <b>${rules.max_renew}</b> 次 · ` +
-      `逾期滞纳金 <b>${money(rules.fine_per_day)}</b> / 天。逾期期间无法续借，请先归还。`;
+      `逾期滞纳金 <b>${money(rules.fine_per_day)}</b> / 天${capNote}。逾期期间无法续借，请先归还。`;
   }
 
   function statusBadge(loan) {

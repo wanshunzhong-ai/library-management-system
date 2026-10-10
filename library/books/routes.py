@@ -35,6 +35,12 @@ def update_book(book_id: int):
     return jsonify(service.update_book(book_id, request.get_json(silent=True) or {}))
 
 
+@bp.post("/<int:book_id>/shelf")
+def set_shelf(book_id: int):
+    """上架 / 下架 / 调库：`{"total_copies": n}`，0 表示下架。"""
+    return jsonify(service.set_total_copies(book_id, request.get_json(silent=True) or {}))
+
+
 @bp.delete("/<int:book_id>")
 def delete_book(book_id: int):
     service.delete_book(book_id)

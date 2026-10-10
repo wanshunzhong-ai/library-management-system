@@ -12,17 +12,23 @@ from __future__ import annotations
 
 import functools
 import hmac
+import ipaddress
 import logging
 import secrets
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from flask import g, jsonify, redirect, request, session, url_for
 
 from config import get_config
 from library.auth import repository as repo
 from library.auth.passwords import hash_password, verify_password  # noqa: F401  对外沿用旧入口
-from library.auth.throttle import LoginThrottle, login_throttle
+from library.auth.throttle import (
+    clear_login_locks,
+    login_throttle,  # noqa: F401  对外沿用旧入口（测试与读者端都从这里取）
+    record_login_failure,
+    remaining_login_lock,
+)
 from library.errors import BusinessRuleError, UnauthorizedError, ValidationError
 
 logger = logging.getLogger(__name__)
@@ -61,9 +67,9 @@ def _start_admin_session(admin: dict[str, Any]) -> str:
     return session[SESSION_CSRF]
 
 
-def _reject_login(key: str, identifier: str, ip: str, kind: str) -> None:
+def _reject_login(identifier: str, ip: str, kind: str) -> None:
     """统一失败出口：计数 + 日志 + 同一条不泄露账号是否存在的提示。"""
-    login_throttle.record_failure(key)
+    record_login_failure(identifier, ip)
     logger.warning(
         "登录失败",
         extra={"extra_fields": {"account": identifier, "ip": ip, "kind": kind}},
@@ -86,8 +92,7 @@ def login_unified(payload: dict[str, Any], ip: str) -> dict[str, Any]:
     if not password:
         raise ValidationError("请输入密码", details={"field": "password"})
 
-    key = LoginThrottle.key_for(identifier, ip)
-    remaining = login_throttle.remaining_lock(key)
+    remaining = remaining_login_lock(identifier, ip)
     if remaining > 0:
         raise BusinessRuleError(f"登录失败次数过多，请 {remaining} 秒后重试")
 
@@ -95,10 +100,10 @@ def login_unified(payload: dict[str, Any], ip: str) -> dict[str, Any]:
     admin = repo.get_by_username(identifier)
     if admin is not None:
         if not verify_password(password, admin["password_hash"]):
-            _reject_login(key, identifier, ip, "admin")
+            _reject_login(identifier, ip, "admin")
         if not int(admin["is_active"]):
             raise BusinessRuleError("该账号已被停用，请联系系统管理员")
-        login_throttle.clear(key)
+        clear_login_locks(identifier, ip)
         repo.touch_login(admin["id"])
         admin = repo.get(admin["id"]) or admin
         csrf = _start_admin_session(admin)
@@ -118,8 +123,8 @@ def login_unified(payload: dict[str, Any], ip: str) -> dict[str, Any]:
     member = reader_service.find_for_auth(identifier)
     if member is not None:
         if not verify_password(password, str(member.get("password_hash") or "")):
-            _reject_login(key, identifier, ip, "reader")
-        login_throttle.clear(key)
+            _reject_login(identifier, ip, "reader")
+        clear_login_locks(identifier, ip)
         csrf = reader_service.start_session(member)
         logger.info(
             "读者登录成功", extra={"extra_fields": {"card_no": member["card_no"], "ip": ip}}
@@ -131,7 +136,7 @@ def login_unified(payload: dict[str, Any], ip: str) -> dict[str, Any]:
             "csrf_token": csrf,
         }
 
-    _reject_login(key, identifier, ip, "unknown")
+    _reject_login(identifier, ip, "unknown")
 
 
 def logout() -> None:
@@ -167,12 +172,83 @@ def csrf_token() -> str:
 # ---------------------------------------------------------------- 装饰器
 
 
+def _trusted_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """解析配置里的受信代理（IP 或 CIDR），带缓存。"""
+    cfg = get_config()
+    raw = tuple(cfg.trusted_proxies)
+    cache = getattr(_trusted_networks, "_cache", None)
+    if cache is not None and cache[0] == raw:
+        return cache[1]
+
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for item in raw:
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.warning("LIBRARY_TRUSTED_PROXIES 条目无法解析，已忽略：%s", item)
+    _trusted_networks._cache = (raw, tuple(networks))  # type: ignore[attr-defined]
+    return _trusted_networks._cache[1]  # type: ignore[attr-defined]
+
+
+def _is_trusted_proxy(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for network in _trusted_networks():
+        try:
+            if addr in network:
+                return True
+        except TypeError:  # IPv4 / IPv6 版本不一致
+            continue
+    return False
+
+
 def client_ip() -> str:
-    """取客户端 IP（优先 X-Forwarded-For 第一跳），登录限流按 IP 维度统计。"""
+    """取真实客户端 IP。
+
+    只有请求确实来自受信代理（``LIBRARY_TRUSTED_PROXIES``）时才采信
+    ``X-Forwarded-For``，且在代理链中从右向左取第一个非受信地址 ——
+    否则任意客户端都能靠伪造请求头换一个新的限流桶，登录锁定形同虚设。
+    """
+    remote = (request.remote_addr or "-").strip()
+    if not _is_trusted_proxy(remote):
+        return remote
+
     forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "-"
+    chain = [part.strip() for part in forwarded.split(",") if part.strip()]
+    if not chain:
+        return remote
+    for hop in reversed(chain):
+        if not _is_trusted_proxy(hop):
+            return hop
+    return chain[0]
+
+
+def admin_password_is_default(admin: Mapping[str, Any]) -> bool:
+    """该管理员账号的密码是否仍是配置里的初始口令。"""
+    cfg = get_config()
+    if not cfg.admin_password:
+        return False
+    return verify_password(cfg.admin_password, str(admin.get("password_hash") or ""))
+
+
+def admins_using_default_password() -> list[str]:
+    """仍在使用初始口令的管理员用户名列表（启动自检用）。"""
+    cfg = get_config()
+    if not cfg.admin_password:
+        return []
+    return [
+        str(row["username"])
+        for row in repo.list_all()
+        if verify_password(cfg.admin_password, str(row.get("password_hash") or ""))
+    ]
+
+
+def security_status(admin: Mapping[str, Any]) -> dict[str, Any]:
+    """后台首页的安全提示信号（前端据此显示醒目横幅）。"""
+    row = repo.get(int(admin["id"])) or {}
+    return {"default_admin_password": admin_password_is_default(row)}
 
 
 def _wants_json() -> bool:

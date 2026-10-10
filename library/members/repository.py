@@ -14,6 +14,19 @@ _PUBLIC_COLUMNS = (
 # 鉴权专用：额外带出密码哈希，仅 reader 登录流程内部使用
 _AUTH_COLUMNS = f"{_PUBLIC_COLUMNS}, password_hash"
 
+# 允许前端排序的列（对外键 → 列/别名白名单）。能排序的别名必须出现在 list_members 的 SELECT 里。
+_SORT_COLUMNS = {
+    "id": "m.id",
+    "card_no": "m.card_no COLLATE NOCASE",
+    "name": "m.name COLLATE NOCASE",
+    "member_type": "m.member_type COLLATE NOCASE",
+    "status": "CASE m.status WHEN 'active' THEN 0 ELSE 1 END",
+    "max_borrow": "m.max_borrow",
+    "active_loans": "active_loans",
+    "overdue_loans": "overdue_loans",
+}
+_DEFAULT_ORDER = "m.id DESC"
+
 
 def _build_filters(filters: Mapping[str, Any], *, alias: str = "") -> tuple[str, list[Any]]:
     """生成 WHERE 子句，过滤条件下推到 SQL（不在应用层筛）。"""
@@ -43,14 +56,15 @@ def count(filters: Mapping[str, Any]) -> int:
 
 def list_members(filters: Mapping[str, Any], *, limit: int, offset: int) -> list[dict[str, Any]]:
     where, params = _build_filters(filters, alias="m")
+    order = db.order_clause(filters, _SORT_COLUMNS, _DEFAULT_ORDER)
     sql = (
         f"SELECT {', '.join('m.' + c.strip() for c in _PUBLIC_COLUMNS.split(','))}, "
         "       CASE WHEN m.password_hash = '' THEN 0 ELSE 1 END AS has_account, "
         "       (SELECT COUNT(*) FROM loans l WHERE l.member_id = m.id AND l.returned_at IS NULL) AS active_loans, "
         "       (SELECT COUNT(*) FROM loans l WHERE l.member_id = m.id AND l.returned_at IS NULL "
-        "              AND l.due_at < datetime('now', 'localtime')) AS overdue_loans "
+        "              AND date(l.due_at) < date('now', 'localtime')) AS overdue_loans "
         f"FROM members m{where} "
-        "ORDER BY m.id DESC LIMIT ? OFFSET ?"
+        f"ORDER BY {order} LIMIT ? OFFSET ?"
     )
     return db.query_all(sql, [*params, limit, offset])
 
@@ -64,13 +78,31 @@ def get_by_card(card_no: str) -> dict[str, Any] | None:
 
 
 def get_for_auth_by_account(account: str) -> dict[str, Any] | None:
-    """按证号或手机号取读者（含密码哈希），供登录校验使用。"""
+    """按证号或手机号取读者（含密码哈希），供登录校验使用。
+
+    证号与手机号都可以当登录账号，因此两者必须全局唯一（由 members/service
+    在建档与改资料时校验 + 唯一索引兜底）。这里仍优先匹配证号，
+    避免历史脏数据里两者交叉时出现不确定的身份归属。
+    """
     sql = (
         f"SELECT {_AUTH_COLUMNS} FROM members "
         "WHERE card_no = :account OR (phone <> '' AND phone = :account) "
-        "ORDER BY id LIMIT 1"
+        "ORDER BY (card_no = :account) DESC, id LIMIT 1"
     )
     return db.query_one(sql, {"account": account})
+
+
+def find_conflicting_identifier(value: str, *, exclude_id: int | None = None) -> dict[str, Any] | None:
+    """该值是否已被**其他**读者的证号或手机号占用（登录标识必须全局唯一）。"""
+    key = (value or "").strip()
+    if not key:
+        return None
+    sql = "SELECT id, card_no, name, phone FROM members WHERE (card_no = ? OR phone = ?)"
+    params: list[Any] = [key, key]
+    if exclude_id is not None:
+        sql += " AND id <> ?"
+        params.append(exclude_id)
+    return db.query_one(sql + " ORDER BY id LIMIT 1", params)
 
 
 def exists_card(card_no: str, *, exclude_id: int | None = None) -> bool:
@@ -142,7 +174,7 @@ def overdue_count(member_id: int) -> int:
     return int(
         db.query_scalar(
             "SELECT COUNT(*) FROM loans "
-            "WHERE member_id = ? AND returned_at IS NULL AND due_at < datetime('now', 'localtime')",
+            "WHERE member_id = ? AND returned_at IS NULL AND date(due_at) < date('now', 'localtime')",
             [member_id],
         )
         or 0

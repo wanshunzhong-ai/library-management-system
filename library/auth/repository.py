@@ -13,8 +13,18 @@ def count() -> int:
     return int(db.query_scalar("SELECT COUNT(*) FROM admins") or 0)
 
 
+def list_all() -> list[dict[str, Any]]:
+    """全部管理员（启动自检默认口令用）。"""
+    return db.query_all(f"SELECT {_COLUMNS} FROM admins ORDER BY id")
+
+
 def get_by_username(username: str) -> dict[str, Any] | None:
     return db.query_one(f"SELECT {_COLUMNS} FROM admins WHERE username = ?", [username])
+
+
+def exists_username(username: str) -> bool:
+    """该用户名是否已被管理员工号占用（读者证号/手机号不能与之重名，否则登录会互相遮蔽）。"""
+    return bool(db.query_scalar("SELECT 1 FROM admins WHERE username = ? LIMIT 1", [username]))
 
 
 def get(admin_id: int) -> dict[str, Any] | None:

@@ -81,6 +81,8 @@ def seed(force: bool = False) -> bool:
 
         # 构造借阅历史：约 45 条，覆盖「已归还 / 在借 / 逾期」三种状态
         open_counter: dict[int, int] = {}
+        # 同一读者不能同时借同一本书两次（业务规则 + 唯一索引都禁止），生成时先避开
+        open_pairs: set[tuple[int, int]] = set()
         plans: list[tuple[int, int, int, int | None]] = []
         for _ in range(45):
             book_id, total = rng.choice(book_ids)
@@ -90,6 +92,9 @@ def seed(force: bool = False) -> bool:
             borrowed_days_ago = rng.randint(1, 120)
             returned_after = None if rng.random() < 0.42 else rng.randint(1, min(30, borrowed_days_ago))
             if returned_after is None:
+                if (book_id, member_id) in open_pairs:
+                    continue
+                open_pairs.add((book_id, member_id))
                 open_counter[book_id] = open_counter.get(book_id, 0) + 1
             plans.append((book_id, member_id, borrowed_days_ago, returned_after))
 

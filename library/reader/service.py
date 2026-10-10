@@ -17,9 +17,14 @@ from typing import Any, Callable, Mapping
 from flask import g, jsonify, redirect, request, session, url_for
 
 from config import get_config
-from library import db
+from library import db, fine
 from library.auth.passwords import hash_password, verify_password
-from library.auth.throttle import LoginThrottle, login_throttle
+from library.auth.throttle import (
+    clear_login_locks,
+    login_throttle,  # noqa: F401  对外沿用旧入口
+    record_login_failure,
+    remaining_login_lock,
+)
 from library.errors import (
     BusinessRuleError,
     ForbiddenError,
@@ -30,6 +35,7 @@ from library.errors import (
 from library.loans import repository as loan_repo
 from library.loans import service as loan_service
 from library.members import repository as member_repo
+from library.members import service as member_service
 from library.validation import optional_email, optional_str
 
 logger = logging.getLogger(__name__)
@@ -99,18 +105,17 @@ def login(payload: Mapping[str, Any], ip: str) -> dict[str, Any]:
     if not password:
         raise ValidationError("请输入密码", details={"field": "password"})
 
-    key = LoginThrottle.key_for(account, ip)
-    remaining = reader_throttle.remaining_lock(key)
+    remaining = remaining_login_lock(account, ip)
     if remaining > 0:
         raise BusinessRuleError(f"登录失败次数过多，请 {remaining} 秒后重试")
 
     row = member_repo.get_for_auth_by_account(account)
     if row is None or not verify_password(password, str(row.get("password_hash") or "")):
-        reader_throttle.record_failure(key)
+        record_login_failure(account, ip)
         logger.warning("读者登录失败", extra={"extra_fields": {"account": account, "ip": ip}})
         raise UnauthorizedError("账号或密码不正确", details={"field": "password"})
 
-    reader_throttle.clear(key)
+    clear_login_locks(account, ip)
     csrf = start_session(row)
     row = member_repo.get(int(row["id"])) or row
 
@@ -191,36 +196,39 @@ def reader_required(view: Callable) -> Callable:
 
 
 def stats(member: Mapping[str, Any]) -> dict[str, Any]:
-    """在借 / 逾期 / 历史册数与累计罚金（按日期差 × 日罚金估算）。"""
-    cfg = get_config()
+    """在借 / 逾期 / 历史册数与累计罚金。
+
+    逾期判定、天数与罚金全部走 ``library.fine`` 的统一口径（整日 + 封顶），
+    因此与借阅列表逐行显示、概览估算三者完全一致。
+    """
+    member_id = int(member["id"])
     row = db.query_one(
         """
         SELECT
             SUM(CASE WHEN returned_at IS NULL THEN 1 ELSE 0 END) AS active_loans,
-            SUM(CASE WHEN returned_at IS NULL AND due_at < datetime('now', 'localtime')
+            SUM(CASE WHEN returned_at IS NULL AND date(due_at) < date('now', 'localtime')
                      THEN 1 ELSE 0 END) AS overdue_loans,
             SUM(CASE WHEN returned_at IS NOT NULL THEN 1 ELSE 0 END) AS returned_total,
-            COUNT(*) AS loan_total,
-            SUM(CASE WHEN returned_at IS NULL
-                     THEN MAX(0, CAST(julianday(date('now', 'localtime')) - julianday(date(due_at)) AS INTEGER))
-                     ELSE MAX(0, CAST(julianday(date(returned_at)) - julianday(date(due_at)) AS INTEGER))
-                END) AS overdue_days_total
+            COUNT(*) AS loan_total
           FROM loans
          WHERE member_id = ?
         """,
-        [int(member["id"])],
+        [member_id],
     ) or {}
 
+    # 逐笔计算后汇总（含封顶），口径与借阅列表一致
+    settlements = db.query_all(
+        "SELECT due_at, returned_at FROM loans WHERE member_id = ?", [member_id]
+    )
     active = int(row.get("active_loans") or 0)
-    overdue_days = int(row.get("overdue_days_total") or 0)
     return {
         "active_loans": active,
         "overdue_loans": int(row.get("overdue_loans") or 0),
         "returned_total": int(row.get("returned_total") or 0),
         "loan_total": int(row.get("loan_total") or 0),
         "quota_left": max(0, int(member["max_borrow"]) - active),
-        "fine_total": round(overdue_days * cfg.fine_per_day, 2),
-        "overdue_days_total": overdue_days,
+        "fine_total": fine.total_fine(settlements),
+        "overdue_days_total": fine.total_overdue_days(settlements),
     }
 
 
@@ -236,6 +244,8 @@ def me() -> dict[str, Any]:
             "loan_days": cfg.loan_days,
             "max_renew": cfg.max_renew,
             "fine_per_day": cfg.fine_per_day,
+            "fine_max_days": cfg.fine_max_days,
+            "fine_cap": cfg.fine_cap,
         },
         "library": {"name": cfg.library_name, "slogan": cfg.library_slogan},
         "csrf_token": csrf_token(),
@@ -286,17 +296,10 @@ def update_profile(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dic
     phone = optional_str(payload, "phone", label="手机号", max_length=20)
     email = optional_email(payload, "email")
 
-    # 手机号可用于登录，必须保证不与其它读者冲突
-    if phone:
-        conflict = db.query_one(
-            "SELECT id, name FROM members WHERE phone = ? AND id <> ? LIMIT 1",
-            [phone, int(member["id"])],
-        )
-        if conflict is not None:
-            raise BusinessRuleError(
-                "该手机号已被其他读者使用，请更换或联系管理员",
-                details={"field": "phone"},
-            )
+    # 手机号可用于登录，必须与其它读者的证号 / 手机号以及管理员工号全局唯一
+    member_service.ensure_identifier_available(
+        phone, field="phone", label="手机号", exclude_member_id=int(member["id"])
+    )
 
     member_repo.update_contact(int(member["id"]), phone, email)
     row = member_repo.get(int(member["id"])) or {}

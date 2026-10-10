@@ -28,14 +28,23 @@
     const layer = $("#toastLayer");
     const el = document.createElement("div");
     el.className = "toast " + (kind || "ok");
-    el.innerHTML = `<div class="t-title">${esc(title)}</div>` + (body ? `<div class="t-body">${esc(body)}</div>` : "");
+    el.setAttribute("role", kind === "error" ? "alert" : "status");
+    el.innerHTML =
+      '<button class="t-close" type="button" aria-label="关闭提示">✕</button>' +
+      `<div class="t-title">${esc(title)}</div>` +
+      (body ? `<div class="t-body">${esc(body)}</div>` : "");
     layer.appendChild(el);
-    setTimeout(() => {
-      el.style.transition = "opacity .2s, transform .2s";
-      el.style.opacity = "0";
-      el.style.transform = "translateX(16px)";
+
+    const wait = kind === "error" ? 5200 : 2800;
+    let timer = setTimeout(dismiss, wait);
+    function dismiss() {
+      clearTimeout(timer);
+      el.classList.add("out");
       setTimeout(() => el.remove(), 220);
-    }, kind === "error" ? 5000 : 2600);
+    }
+    el.querySelector(".t-close").addEventListener("click", dismiss);
+    el.addEventListener("mouseenter", () => clearTimeout(timer));
+    el.addEventListener("mouseleave", () => { timer = setTimeout(dismiss, wait); });
   };
 
   const getJSON = async (path, params) => {
@@ -220,11 +229,21 @@
     if (lastFocused && lastFocused.focus) lastFocused.focus();
   }
 
+  /** 罚金说明：把封顶规则如实告诉读者，避免「越拖越多」的误解。 */
+  function fineCapNote(rules) {
+    const cap = Number(rules.fine_cap) || 0;
+    const days = Number(rules.fine_max_days) || 0;
+    if (cap > 0 && days > 0) return `按天累计，${days} 天或 ${money(cap)} 封顶`;
+    if (cap > 0) return `按天累计，单笔封顶 ${money(cap)}`;
+    if (days > 0) return `按天累计，最长计息 ${days} 天`;
+    return "按逾期天数累计";
+  }
+
   function renderRules(rules) {
     const cards = [
       { ico: "📖", v: rules.loan_days, u: "天", k: "单次借期", d: "自借出之日起计算" },
       { ico: "🔁", v: rules.max_renew, u: "次", k: "可续借次数", d: "每次续借顺延一个借期" },
-      { ico: "💰", v: money(rules.fine_per_day), u: "", k: "逾期罚金", d: "按逾期天数累计" },
+      { ico: "💰", v: money(rules.fine_per_day), u: "", k: "逾期罚金", d: fineCapNote(rules) },
       { ico: "🎫", v: rules.max_borrow, u: "册", k: "默认可借上限", d: "教师与 VIP 读者更高" },
     ];
     $("#ruleGrid").innerHTML = cards

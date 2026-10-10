@@ -72,6 +72,37 @@ def cmd_reset(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(_args: argparse.Namespace) -> int:
+    """数据体检：库存越界、重复在借、重复手机号、登录标识互相遮蔽等。"""
+    import json
+
+    cfg = _bootstrap()
+    app = create_app(cfg)
+    with app.app_context():
+        report = db.check_consistency()
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["ok"]:
+        print("\n数据体检通过。")
+        return 0
+    print(f"\n发现 {len(report['issues'])} 处问题，可尝试 `python app.py repair`。")
+    return 1
+
+
+def cmd_repair(_args: argparse.Namespace) -> int:
+    """修复有明确答案的问题（目前只处理「同一读者同一本书的重复在借」）。"""
+    cfg = _bootstrap()
+    app = create_app(cfg)
+    with app.app_context():
+        result = db.repair_consistency()
+    if not result["closed_loans"]:
+        print("没有需要修复的重复在借记录。")
+        return 0 if result["after"]["ok"] else 1
+    print(f"已把 {result['closed_loans']} 条重复在借记录标记为已归还，库存同步修正。")
+    if not result["after"]["ok"]:
+        print(f"仍有 {len(result['after']['issues'])} 处问题需要人工处理。")
+    return 0 if result["after"]["ok"] else 1
+
+
 def _install_signal_handlers() -> None:
     def _handler(signum, _frame):
         logger.info("收到退出信号，正在关闭服务", extra={"extra_fields": {"signal": signum}})
@@ -100,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     seed_cmd.set_defaults(func=cmd_seed)
 
     sub.add_parser("reset", help="重置数据库并重建演示数据").set_defaults(func=cmd_reset)
+
+    sub.add_parser("check", help="数据体检（库存 / 重复在借 / 登录标识冲突）").set_defaults(func=cmd_check)
+
+    sub.add_parser("repair", help="修复重复在借记录并补建唯一索引").set_defaults(func=cmd_repair)
     return parser
 
 

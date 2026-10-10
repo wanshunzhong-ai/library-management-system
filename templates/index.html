@@ -26,6 +26,7 @@
         <div class="policy-row"><span>借期</span><b id="policyDays">—</b></div>
         <div class="policy-row"><span>可续借</span><b id="policyRenew">—</b></div>
         <div class="policy-row"><span>逾期罚金</span><b id="policyFine">—</b></div>
+        <div class="policy-row"><span>罚金封顶</span><b id="policyFineCap">—</b></div>
       </div>
     </aside>
 
@@ -48,6 +49,24 @@
           <button class="btn" id="logoutBtn">退出登录</button>
         </div>
       </header>
+
+      <div class="alert alert-danger" id="securityBanner" role="alert" hidden>
+        <span class="alert-ico">!</span>
+        <div class="alert-text">
+          <b>后台仍在使用初始管理员口令</b>
+          <span>任何知道默认口令的人都可能进入后台，请立即修改密码。</span>
+        </div>
+        <button class="btn primary sm" id="securityBannerBtn" type="button">立即修改</button>
+      </div>
+
+      <div class="alert alert-warn" id="sessionBanner" role="status" hidden>
+        <span class="alert-ico">⏳</span>
+        <div class="alert-text">
+          <b id="sessionBannerTitle">会话即将过期</b>
+          <span id="sessionBannerText">长时间未操作，登录状态即将失效，弹窗中未保存的内容会丢失。</span>
+        </div>
+        <button class="btn primary sm" id="sessionBannerBtn" type="button">保持登录</button>
+      </div>
 
       <section class="view is-active" id="view-dashboard">
         <div class="stat-grid" id="statGrid"></div>
@@ -81,6 +100,7 @@
           <select id="bookCategory" class="select"></select>
           <label class="check"><input type="checkbox" id="bookAvailableOnly" /> 仅看可借</label>
           <button class="btn ghost" id="bookReset">重置</button>
+          <button class="btn ghost" id="bookExport">导出 CSV</button>
           <div class="spacer"></div>
           <button class="btn primary" id="bookCreate">+ 新增图书</button>
         </div>
@@ -101,6 +121,7 @@
             <option value="frozen">已冻结</option>
           </select>
           <button class="btn ghost" id="memberReset">重置</button>
+          <button class="btn ghost" id="memberExport">导出 CSV</button>
           <div class="spacer"></div>
           <button class="btn primary" id="memberCreate">+ 新增读者</button>
         </div>
@@ -122,6 +143,9 @@
             <input id="loanKeyword" type="search" placeholder="搜索书名 / 条码 / 读者 / 证号" />
           </div>
           <button class="btn ghost" id="loanReset">重置</button>
+          <button class="btn ghost" id="loanExport">导出 CSV</button>
+          <button class="btn" id="loanReturnBatch" disabled title="勾选下方未归还记录后一键归还">批量还书</button>
+          <span class="sel-count" id="loanSelCount"></span>
           <div class="spacer"></div>
           <button class="btn primary" id="loanBorrow">+ 办理借书</button>
         </div>
@@ -134,7 +158,7 @@
   </div>
 
   <div class="modal-layer" id="modalLayer" hidden>
-    <div class="modal" id="modal">
+    <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" tabindex="-1">
       <div class="modal-head">
         <h3 id="modalTitle">标题</h3>
         <button class="icon-btn" id="modalClose" aria-label="关闭">✕</button>

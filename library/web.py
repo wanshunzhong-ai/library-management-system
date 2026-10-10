@@ -55,6 +55,7 @@ def create_app(config: Config | None = None) -> Flask:
         db.init_db()
         auth_service.ensure_default_admin()
         member_service.ensure_reader_accounts()
+        _warn_if_default_admin_password()
         # 老库升级后补上演示书目简介（仅补空值，失败不阻塞启动）
         try:
             from library import seed as seed_module
@@ -64,6 +65,21 @@ def create_app(config: Config | None = None) -> Flask:
             logger.warning("演示简介回填失败，已跳过", exc_info=True)
 
     return app
+
+
+def _warn_if_default_admin_password() -> None:
+    """启动自检：还有管理员在用配置里的初始口令时，喊一嗓子。
+
+    后台控制台也会显示醒目横幅（``/api/auth/me`` 的 ``security`` 字段）。
+    不直接拒绝启动，是为了保留「开箱即用」——但生产部署必须改掉。
+    """
+    usernames = auth_service.admins_using_default_password()
+    if not usernames:
+        return
+    logger.warning(
+        "检测到仍在使用初始管理员口令的账号：%s —— 任何知道默认口令的人都能进入后台，请立即修改密码",
+        "、".join(usernames),
+    )
 
 
 def _register_blueprints(app: Flask) -> None:
@@ -172,11 +188,29 @@ def _register_error_handlers(app: Flask) -> None:
 
     @app.errorhandler(sqlite3.IntegrityError)
     def _handle_integrity(exc: sqlite3.IntegrityError):
+        """把 SQLite 约束违规翻译成能指明排查方向的中文提示。
+
+        原先一律返回「唯一字段重复」的 409：NOT NULL / CHECK 违规时提示会把人
+        引到错误的方向（去查重，而真正的问题是空值或库存越界）。
+        """
+        name = str(getattr(exc, "sqlite_errorname", "") or "").upper()
         logger.warning("integrity error: %s", exc)
-        return (
-            jsonify({"error": {"code": "conflict", "message": "数据约束冲突，请检查唯一字段是否重复"}, "request_id": _request_id()}),
-            409,
-        )
+        if "UNIQUE" in name or "PRIMARYKEY" in name:
+            code, status = "conflict", 409
+            message = "数据约束冲突：唯一字段（ISBN / 条码 / 借书证号 / 手机号）已存在"
+        elif "NOTNULL" in name:
+            code, status = "validation_error", 400
+            message = "存在必填字段为空，请补全后重试"
+        elif "CHECK" in name:
+            code, status = "validation_error", 400
+            message = "数据不满足一致性约束（例如可借数不能大于总册数、可借数不能为负）"
+        elif "FOREIGNKEY" in name:
+            code, status = "conflict", 409
+            message = "存在关联数据引用，无法完成该操作"
+        else:
+            code, status = "conflict", 409
+            message = "数据约束冲突，请检查输入内容后重试"
+        return jsonify({"error": {"code": code, "message": message}, "request_id": _request_id()}), status
 
     @app.errorhandler(404)
     def _handle_404(_exc):

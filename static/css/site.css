@@ -120,13 +120,22 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .toast {
   min-width: 220px; max-width: 380px; background: var(--surface); border: 1px solid var(--border);
   border-left: 3px solid var(--primary); border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-lg); padding: 10px 14px; font-size: 13px; animation: toastIn .2s ease;
+  box-shadow: var(--shadow-lg); padding: 10px 30px 10px 14px; font-size: 13px;
+  position: relative; animation: toastIn .2s ease;
 }
+.toast.out { opacity: 0; transform: translateX(16px); transition: opacity .2s, transform .2s; }
+.toast .t-close {
+  position: absolute; top: 5px; right: 6px; width: 20px; height: 20px;
+  border: 0; background: transparent; cursor: pointer; color: var(--muted);
+  font-size: 12px; line-height: 1; border-radius: 5px; padding: 0;
+}
+.toast .t-close:hover { background: var(--surface-alt); color: var(--text); }
 .toast.ok { border-left-color: var(--ok); }
 .toast.error { border-left-color: var(--danger); }
 .toast.warn { border-left-color: var(--warn); }
 .toast .t-title { font-weight: 600; }
 .toast .t-body { color: var(--text-soft); font-size: 12.5px; word-break: break-word; }
+.toast .t-action { margin-top: 8px; }
 @keyframes toastIn { from { transform: translateX(16px); opacity: 0; } to { transform: none; opacity: 1; } }
 
 /* 空状态 */

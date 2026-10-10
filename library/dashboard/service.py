@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from config import get_config
+from library import fine
 from library.books import service as book_service
 from library.dashboard import repository as repo
 from library.loans import repository as loan_repo
@@ -21,11 +22,14 @@ def overview(query: dict[str, Any] | None = None) -> dict[str, Any]:
         "books": repo.book_stats(),
         "members": repo.member_stats(),
         "loans": repo.loan_stats(),
-        "fine_estimate": round(repo.overdue_days_sum() * cfg.fine_per_day, 2),
+        # 罚金估算与借阅列表逐行展示、读者中心汇总共用同一口径（整日 + 封顶）
+        "fine_estimate": fine.total_fine(loan_repo.open_loan_settlements()),
         "policy": {
             "loan_days": cfg.loan_days,
             "max_renew": cfg.max_renew,
             "fine_per_day": cfg.fine_per_day,
+            "fine_max_days": cfg.fine_max_days,
+            "fine_cap": cfg.fine_cap,
             "default_max_borrow": cfg.default_max_borrow,
         },
         "trend": _fill_trend(loan_repo.borrow_activity(trend_days), trend_days),

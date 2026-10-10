@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 from datetime import timedelta
@@ -13,9 +14,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import Config  # noqa: E402
+from config import Config, get_config  # noqa: E402
 from library import db, timeutil  # noqa: E402
 from library.auth import service as auth_service  # noqa: E402
+from library.validation import isbn_check  # noqa: E402
 from library.web import create_app  # noqa: E402
 
 PASSED = 0
@@ -33,6 +35,15 @@ def check(label: str, condition: bool, extra: str = "") -> None:
     else:
         FAILED += 1
         print(f"  [FAIL] {label} {extra}")
+
+
+def config_rejected(module) -> bool:
+    """调用 module.load_config() 并判断是否被配置校验拒绝。"""
+    try:
+        module.load_config()
+    except module.ConfigError:
+        return True
+    return False
 
 
 def build_app(db_path: str):
@@ -132,6 +143,7 @@ def main() -> int:
     check("GET /api/members 未登录 401", client.get("/api/members").status_code == 401)
     check("GET /api/dashboard/overview 未登录 401", client.get("/api/dashboard/overview").status_code == 401)
     check("POST /api/loans/borrow 未登录 401", client.post("/api/loans/borrow", json={}).status_code == 401)
+    check("POST /api/books/1/shelf 未登录 401", client.post("/api/books/1/shelf", json={"total_copies": 0}).status_code == 401)
     r = client.get("/admin")
     check(
         "GET /admin 未登录跳统一登录页",
@@ -169,6 +181,11 @@ def main() -> int:
     r = client.get("/api/auth/me")
     check("登录后 /api/auth/me 可用", r.status_code == 200, r.status_code)
     check("/api/auth/me 回带 csrf", bool(r.get_json().get("csrf_token")), r.get_json())
+    check(
+        "后台回报仍在使用初始口令（横幅提示依据）",
+        r.get_json()["security"]["default_admin_password"] is True,
+        r.get_json().get("security"),
+    )
 
     r = client.get("/admin")
     check("登录后可进入后台控制台", r.status_code == 200, r.status_code)
@@ -201,6 +218,8 @@ def main() -> int:
     check("CSRF 失败有明确错误码", r.get_json()["error"]["code"] == "csrf_failed", r.get_json())
     r = client.put("/api/books/1", json={})
     check("PUT 缺少 CSRF 头返回 403", r.status_code == 403, r.status_code)
+    r = client.post("/api/books/1/shelf", json={"total_copies": 0})
+    check("上下架缺少 CSRF 头返回 403", r.status_code == 403, r.status_code)
 
     print("\n=== 6. 图书 CRUD 与校验 ===")
     book = {
@@ -366,6 +385,72 @@ def main() -> int:
     check("有在借图书不可删除 409", api.delete(f"/api/books/{book_id}").status_code == 409)
     check("有在借读者不可删除 409", api.delete(f"/api/members/{member_id}").status_code == 409)
 
+    print("\n=== 12B. 图书下架闭环 ===")
+    detail = api.get(f"/api/books/{book_id}").get_json()
+    book_title = detail["title"]
+    public_before = client.get("/api/public/overview").get_json()["stats"]
+    check("在架图书 off_shelf=False", detail.get("off_shelf") is False, detail.get("off_shelf"))
+    check("图书列表带 off_shelf 字段", "off_shelf" in api.get("/api/books").get_json()["items"][0])
+    check(
+        "下架前门户可检索到该书",
+        client.get("/api/public/search", query_string={"keyword": book_title}).get_json()["total"] == 1,
+    )
+
+    r = api.post(f"/api/books/{book_id}/shelf", json={"total_copies": -1})
+    check("总册数为负返回 400", r.status_code == 400, r.status_code)
+
+    r = api.post(f"/api/books/{book_id}/shelf", json={"total_copies": 0})
+    check("下架 200", r.status_code == 200, r.get_json())
+    check("下架后总册数为 0", r.get_json()["total_copies"] == 0, r.get_json())
+    check("下架后可借数为 0", r.get_json()["available_copies"] == 0, r.get_json())
+    check("下架后 off_shelf=True", r.get_json()["off_shelf"] is True, r.get_json())
+
+    check(
+        "下架后门户检索不到",
+        client.get("/api/public/search", query_string={"keyword": book_title}).get_json()["total"] == 0,
+    )
+    arrivals = client.get("/api/public/overview").get_json()["new_arrivals"]
+    check("下架后不在门户新书榜", all(int(b["id"]) != book_id for b in arrivals), [b["id"] for b in arrivals])
+    public_after = client.get("/api/public/overview").get_json()["stats"]
+    check(
+        "下架后门户藏书量减 1",
+        int(public_after["total_titles"]) == int(public_before["total_titles"]) - 1,
+        (public_before.get("total_titles"), public_after.get("total_titles")),
+    )
+
+    r = api.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id})
+    check("下架图书不可借出 422", r.status_code == 422, r.get_json())
+    check("下架借书提示明确", "已下架" in r.get_json()["error"]["message"], r.get_json())
+
+    check(
+        "概览统计到已下架种数",
+        api.get("/api/dashboard/overview").get_json()["books"]["off_shelf_titles"] >= 1,
+    )
+
+    r = api.post(f"/api/books/{ids[0]}/shelf", json={"total_copies": 0})
+    check("有在借时下架被拒 409", r.status_code == 409, r.get_json())
+    check("下架被拒提示含未归还", "未归还" in r.get_json()["error"]["message"], r.get_json())
+
+    r = api.post(f"/api/books/{book_id}/shelf", json={"total_copies": 2})
+    check("重新上架 200", r.status_code == 200, r.get_json())
+    check("上架后总册数为 2", r.get_json()["total_copies"] == 2, r.get_json())
+    check("上架后可借数恢复为 2", r.get_json()["available_copies"] == 2, r.get_json())
+    check("上架后 off_shelf=False", r.get_json()["off_shelf"] is False, r.get_json())
+    check(
+        "上架后门户重新可见",
+        client.get("/api/public/search", query_string={"keyword": book_title}).get_json()["total"] == 1,
+    )
+    check(
+        "概览已下架种数归零",
+        api.get("/api/dashboard/overview").get_json()["books"]["off_shelf_titles"] == 0,
+    )
+    check("查询不存在的图书下架 404", api.post("/api/books/99999/shelf", json={"total_copies": 1}).status_code == 404)
+    check(
+        "下架闭环后库存对账仍一致",
+        db.check_consistency()["ok"],
+        db.check_consistency()["issues"],
+    )
+
     print("\n=== 13. 概览统计 ===")
     r = api.get("/api/dashboard/overview")
     check("概览 200", r.status_code == 200, r.status_code)
@@ -406,6 +491,11 @@ def main() -> int:
     r = client.post("/api/auth/login", json={"username": ADMIN_USER, "password": "newpass123"})
     check("新密码可登录", r.status_code == 200, r.get_json())
     api.csrf = r.get_json()["csrf_token"]
+    check(
+        "改密后不再提示默认口令",
+        client.get("/api/auth/me").get_json()["security"]["default_admin_password"] is False,
+        client.get("/api/auth/me").get_json().get("security"),
+    )
     check("登出接口可用", api.post("/api/auth/logout").status_code == 200)
     check("登出后接口不可用", client.get("/api/books").status_code == 401)
 
@@ -529,7 +619,8 @@ def main() -> int:
     r = reader.put("/api/reader/profile", json={"phone": "13900001234", "email": "newwang@example.com"}, headers={"X-CSRF-Token": reader_csrf})
     check("修改联系方式成功", r.status_code == 200 and r.get_json()["phone"] == "13900001234", r.get_json())
     r = reader.put("/api/reader/profile", json={"phone": "13800001111"}, headers={"X-CSRF-Token": reader_csrf})
-    check("手机号被他人占用 422", r.status_code == 422, r.get_json())
+    check("手机号被他人占用 409", r.status_code == 409, r.get_json())
+    check("占用冲突返回 conflict 错误码", r.get_json()["error"]["code"] == "conflict", r.get_json())
     check("非法邮箱 400", reader.put("/api/reader/profile", json={"email": "bad-email"}, headers={"X-CSRF-Token": reader_csrf}).status_code == 400)
     check("改手机号后可用新号登录", app.test_client().post("/api/reader/login", json={"account": "13900001234", "password": "026002"}).status_code == 200)
 
@@ -593,6 +684,424 @@ def main() -> int:
     check("冻结读者历史记录仍可查", frozen.get("/api/reader/loans").get_json()["total"] >= 1)
     check("读者借阅记录带馆藏条码", all("book_barcode" in item for item in frozen.get("/api/reader/loans").get_json()["items"]))
 
+    print("\n=== 23B. 并发写入与数据一致性（借阅写路径原子性） ===")
+    import threading  # noqa: PLC0415 - 仅本段使用
+
+    from library.loans import service as loan_service  # noqa: PLC0415
+
+    def run_concurrently(fn, times):
+        """让 times 个线程尽量同时执行 fn(slot)，返回 [(状态, 结果或异常)] 列表。"""
+
+        barrier = threading.Barrier(times)
+        results: list = [None] * times
+
+        def worker(slot):
+            db.get_conn()  # 先建好线程本地连接，避免并发初始化连接时争用
+            try:
+                barrier.wait(timeout=10)
+            except threading.BrokenBarrierError:
+                pass
+            try:
+                results[slot] = ("ok", fn(slot))
+            except Exception as exc:  # noqa: BLE001 - 测试需要观察任意异常
+                results[slot] = ("err", exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(times)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        return results
+
+    def succeeded(results):
+        return [payload for status, payload in results if status == "ok"]
+
+    def failures(results):
+        return [str(payload) for status, payload in results if status == "err"]
+
+    with app.app_context():
+        con_a = db.execute(
+            "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+            "VALUES ('2099001', '并发读者甲', '学生', 'active', 1)"
+        )
+        con_b = db.execute(
+            "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+            "VALUES ('2099002', '并发读者乙', '学生', 'active', 5)"
+        )
+        con_c = db.execute(
+            "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+            "VALUES ('2099003', '并发读者丙', '学生', 'active', 5)"
+        )
+        con_d = db.execute(
+            "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+            "VALUES ('2099004', '并发读者丁', '学生', 'active', 5)"
+        )
+        con_books = [
+            db.execute(
+                "INSERT INTO books (isbn, title, category, total_copies, available_copies) "
+                "VALUES (?, ?, '并发测试', 3, 3)",
+                [f"99000000000{i:02d}", f"并发测试书 {i}"],
+            )
+            for i in range(1, 6)
+        ]
+    con_x, con_y, con_z, con_w, con_r = con_books
+
+    # 1) 同一读者（上限 1 册）并发借两本不同的书 —— 只能成功一次
+    results = run_concurrently(
+        lambda slot: loan_service.borrow({"book_id": [con_x, con_y][slot], "member_id": con_a}), 2
+    )
+    check("并发借两本书只成功 1 次（不突破可借上限）", len(succeeded(results)) == 1, failures(results))
+    with app.app_context():
+        open_of_a = int(db.query_scalar("SELECT COUNT(*) FROM loans WHERE member_id = ? AND returned_at IS NULL", [con_a]))
+    check("并发后该读者在借数不超过上限 1", open_of_a <= 1, open_of_a)
+
+    # 2) 同一读者并发借同一本书 —— 只能成功一次，且只留一条在借记录
+    results = run_concurrently(
+        lambda slot: loan_service.borrow({"book_id": con_z, "member_id": con_b}), 6
+    )
+    check("并发借同一本书只成功 1 次", len(succeeded(results)) == 1, failures(results))
+    with app.app_context():
+        dup_open = int(
+            db.query_scalar(
+                "SELECT COUNT(*) FROM loans WHERE book_id = ? AND member_id = ? AND returned_at IS NULL",
+                [con_z, con_b],
+            )
+        )
+        stock_z = db.query_one("SELECT total_copies, available_copies FROM books WHERE id = ?", [con_z])
+    check("同一读者同一本书只有一条在借记录", dup_open == 1, dup_open)
+    check("并发借书后库存与借阅数对得上", stock_z["available_copies"] == stock_z["total_copies"] - 1, stock_z)
+
+    # 3) 并发还同一笔借阅 —— 只能成功一次，库存只回补一册
+    loan_c = loan_service.borrow({"book_id": con_w, "member_id": con_c})
+    with app.app_context():
+        stock_before = db.query_one("SELECT total_copies, available_copies FROM books WHERE id = ?", [con_w])
+    results = run_concurrently(lambda slot: loan_service.return_book(loan_c["id"]), 6)
+    check("并发还书只成功 1 次", len(succeeded(results)) == 1, failures(results))
+    with app.app_context():
+        stock_after = db.query_one("SELECT total_copies, available_copies FROM books WHERE id = ?", [con_w])
+    check(
+        "并发还书库存只回补一次",
+        stock_after["available_copies"] == stock_before["available_copies"] + 1,
+        (dict(stock_before), dict(stock_after)),
+    )
+    check("还书后可借数不超过总册数", stock_after["available_copies"] <= stock_after["total_copies"], stock_after)
+
+    # 4) 并发续借同一笔借阅 —— 续借次数不得突破上限（配置为 2）
+    loan_d = loan_service.borrow({"book_id": con_r, "member_id": con_d})
+    results = run_concurrently(lambda slot: loan_service.renew(loan_d["id"]), 8)
+    with app.app_context():
+        renew_count = int(db.query_scalar("SELECT renew_count FROM loans WHERE id = ?", [loan_d["id"]]))
+    check("并发续借后次数不超过上限 2", renew_count <= 2, renew_count)
+    check("并发续借成功次数与记录一致", len(succeeded(results)) == renew_count, (len(succeeded(results)), renew_count))
+
+    # 5) 全局数据一致性自检
+    with app.app_context():
+        report = db.check_consistency()
+    check("库存一致性自检通过（区间 / 重复在借 / 总量对账）", report["ok"] is True, report["issues"])
+    check(
+        "不存在越界库存与重复在借",
+        not any(i["type"] in ("inventory_out_of_range", "duplicate_open_loan") for i in report["issues"]),
+        report["issues"],
+    )
+    check(
+        "同一读者同一本书的唯一索引已建立",
+        bool(
+            db.query_all(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_loans_open_unique'"
+            )
+        ),
+    )
+
+    # 6) 数据库层兜底：CHECK 约束阻止可借数超过总册数
+    import sqlite3 as _sqlite3  # noqa: PLC0415 - 仅本段使用
+
+    with app.app_context():
+        bounded = False
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE books SET available_copies = total_copies + 1 WHERE id = ?", [con_x]
+                )
+        except _sqlite3.IntegrityError:
+            bounded = True
+        else:
+            # 约束若失效，这里把数据夹回来，避免污染后续断言
+            db.execute("UPDATE books SET available_copies = total_copies WHERE id = ?", [con_x])
+    check("新库 CHECK 约束阻止可借数超过总册数", bounded)
+
+    print("\n=== 23C. 会话密钥：自动生成、持久化与弱值拒绝 ===")
+    import config as config_module  # noqa: PLC0415 - 仅本段使用
+    import sqlite3 as _sqlite3  # noqa: PLC0415 - 仅本段使用
+
+    key_dir = os.path.join(tmp_dir, "secrets")
+    key_db = os.path.join(key_dir, "library.db")
+    saved_env = {
+        name: os.environ.get(name)
+        for name in ("LIBRARY_SECRET_KEY", "LIBRARY_DEBUG", "LIBRARY_DB_PATH")
+    }
+    try:
+        os.environ.pop("LIBRARY_SECRET_KEY", None)
+        os.environ["LIBRARY_DEBUG"] = "false"
+        os.environ["LIBRARY_DB_PATH"] = key_db
+
+        generated = config_module.load_config().secret_key
+        check(
+            "未配置会话密钥时自动生成强随机密钥",
+            len(generated) >= 32 and generated.lower() not in config_module._PLACEHOLDER_SECRETS,
+            f"len={len(generated)}",
+        )
+        key_file = config_module.secret_file_path(key_db)
+        check("密钥已落盘到 .secret_key", key_file.exists(), str(key_file))
+        check("落盘内容与运行时密钥一致", key_file.read_text(encoding="utf-8").strip() == generated)
+        check("再次加载沿用同一密钥（重启不掉登录）", config_module.load_config().secret_key == generated)
+
+        os.environ["LIBRARY_SECRET_KEY"] = "please-change-me"
+        check("生产模式拒绝示例会话密钥", config_rejected(config_module))
+        os.environ["LIBRARY_SECRET_KEY"] = "short"
+        check("生产模式拒绝过短会话密钥", config_rejected(config_module))
+        os.environ["LIBRARY_DEBUG"] = "true"
+        check("开发模式仍允许示例密钥（便于本地调试）", config_module.load_config().secret_key == "short")
+    finally:
+        for env_name, env_value in saved_env.items():
+            if env_value is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = env_value
+
+    print("\n=== 23D. 登录限流：伪造 X-Forwarded-For 换不了桶 ===")
+    auth_service.login_throttle.reset()
+    spoof = app.test_client()
+    spoof_codes = [
+        spoof.post(
+            "/api/auth/login",
+            json={"identifier": "xff-test", "password": "x"},
+            headers={"X-Forwarded-For": f"10.0.0.{i}"},
+        ).status_code
+        for i in range(3)
+    ]
+    check("未受信来源下伪造 XFF 仍照常累计失败", spoof_codes == [401, 401, 401], spoof_codes)
+    r = spoof.post(
+        "/api/auth/login",
+        json={"identifier": "xff-test", "password": "x"},
+        headers={"X-Forwarded-For": "203.0.113.9"},
+    )
+    check("换一个伪造 XFF 也不能绕过锁定", r.status_code == 422, r.status_code)
+    auth_service.login_throttle.reset()
+
+    # 同一 IP 轮换账号名（密码喷洒）由 IP 维度桶兜底
+    spray = app.test_client()
+    spray_codes = [
+        spray.post("/api/auth/login", json={"identifier": f"spray-{i}", "password": "x"}).status_code
+        for i in range(24)
+    ]
+    check("零星手误不会触发 IP 桶", spray_codes[:10] == [401] * 10, spray_codes[:10])
+    check("同一 IP 轮换账号名会被 IP 维度桶兜住", 422 in spray_codes, spray_codes[-5:])
+    auth_service.login_throttle.reset()
+
+    from dataclasses import replace as _dc_replace  # noqa: PLC0415 - 仅本段使用
+
+    base_cfg = config_module.get_config()
+    config_module.set_config(_dc_replace(base_cfg, trusted_proxies=("127.0.0.1/32",)))
+    try:
+        auth_service.login_throttle.reset()
+        proxied = app.test_client()
+        proxied_codes = [
+            proxied.post(
+                "/api/auth/login",
+                json={"identifier": "proxy-test", "password": "x"},
+                headers={"X-Forwarded-For": f"198.51.100.{i}"},
+            ).status_code
+            for i in range(3)
+        ]
+        check("受信代理下按 XFF 分桶计数", proxied_codes == [401, 401, 401], proxied_codes)
+        r = proxied.post(
+            "/api/auth/login",
+            json={"identifier": "proxy-test", "password": "x"},
+            headers={"X-Forwarded-For": "198.51.100.99"},
+        )
+        check("受信代理下来自新 IP 的尝试不被误锁", r.status_code == 401, r.status_code)
+        same_ip = {"X-Forwarded-For": "198.51.100.0"}
+        repeat_codes = [
+            proxied.post(
+                "/api/auth/login", json={"identifier": "proxy-test", "password": "x"}, headers=same_ip
+            ).status_code
+            for _ in range(2)
+        ]
+        check("受信代理下同一 XFF 继续累计", repeat_codes == [401, 401], repeat_codes)
+        r = proxied.post(
+            "/api/auth/login", json={"identifier": "proxy-test", "password": "x"}, headers=same_ip
+        )
+        check("受信代理下同一 XFF 达到阈值即锁定", r.status_code == 422, r.status_code)
+    finally:
+        config_module.set_config(base_cfg)
+        auth_service.login_throttle.reset()
+
+    print("\n=== 23E. 登录标识唯一：手机号不得撞证号 / 管理员工号 ===")
+    sec_admin = app.test_client()
+    r = sec_admin.post("/api/auth/login", json={"identifier": ADMIN_USER, "password": "newpass123"})
+    check("安全段：管理员登录", r.status_code == 200, r.get_json())
+    adm = Api(sec_admin)
+    adm.csrf = r.get_json()["csrf_token"]
+
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "8808001", "name": "安全甲", "phone": "13100008001", "member_type": "学生", "status": "active"},
+    )
+    check("创建读者甲", r.status_code == 201, r.get_json())
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "8808002", "name": "安全乙", "phone": "13100008002", "member_type": "学生", "status": "active"},
+    )
+    check("创建读者乙", r.status_code == 201, r.get_json())
+    member_b = r.get_json()
+
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "8808003", "name": "安全丙", "phone": "8808001", "member_type": "学生", "status": "active"},
+    )
+    check("手机号撞他人证号被拒 409", r.status_code == 409, r.get_json())
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "8808004", "name": "安全丁", "phone": "13100008001", "member_type": "学生", "status": "active"},
+    )
+    check("手机号与他人重复被拒 409", r.status_code == 409, r.get_json())
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "13100008002", "name": "安全戊", "phone": "13100008999", "member_type": "学生", "status": "active"},
+    )
+    check("证号撞他人手机号被拒 409", r.status_code == 409, r.get_json())
+    r = adm.post(
+        "/api/members",
+        json={"card_no": "8808005", "name": "安全己", "phone": ADMIN_USER, "member_type": "学生", "status": "active"},
+    )
+    check("手机号撞管理员工号被拒 409", r.status_code == 409, r.get_json())
+    r = adm.post(
+        "/api/members",
+        json={"card_no": ADMIN_USER, "name": "安全庚", "phone": "13100008998", "member_type": "学生", "status": "active"},
+    )
+    check("证号撞管理员工号被拒 409", r.status_code == 409, r.get_json())
+    r = adm.put(
+        f"/api/members/{member_b['id']}",
+        json={"card_no": "8808002", "name": "安全乙", "phone": "8808001", "member_type": "学生", "status": "active"},
+    )
+    check("管理员改档时手机号撞他人证号被拒 409", r.status_code == 409, r.get_json())
+
+    sec_reader = app.test_client()
+    r = sec_reader.post("/api/reader/login", json={"account": "8808002", "password": "808002"})
+    check("安全段：读者乙登录", r.status_code == 200, r.get_json())
+    sec_csrf = r.get_json()["csrf_token"]
+    r = sec_reader.put("/api/reader/profile", json={"phone": "8808001"}, headers={"X-CSRF-Token": sec_csrf})
+    check("读者自助改手机号撞他人证号被拒 409", r.status_code == 409, r.get_json())
+    r = sec_reader.put("/api/reader/profile", json={"phone": "13100008001"}, headers={"X-CSRF-Token": sec_csrf})
+    check("读者自助改手机号与他人重复被拒 409", r.status_code == 409, r.get_json())
+    r = sec_reader.put("/api/reader/profile", json={"phone": "13100009999"}, headers={"X-CSRF-Token": sec_csrf})
+    check(
+        "读者改到未被占用的手机号成功",
+        r.status_code == 200 and r.get_json()["phone"] == "13100009999",
+        r.get_json(),
+    )
+
+    check(
+        "手机号唯一索引已建立",
+        bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_members_phone_unique'")),
+    )
+    blocked = False
+    try:
+        db.execute("UPDATE members SET phone = ? WHERE id = ?", ["13100008001", member_b["id"]])
+    except _sqlite3.IntegrityError:
+        blocked = True
+    check("数据库层唯一索引兜住重复手机号", blocked)
+
+    # 自检能力：临时构造脏数据验证 check_consistency() 能识别（随后立即还原）
+    db.execute("DROP INDEX IF EXISTS idx_members_phone_unique")
+    db.execute("UPDATE members SET phone = ? WHERE id = ?", ["13100008001", member_b["id"]])
+    dup_report = db.check_consistency()
+    check(
+        "自检能发现重复手机号",
+        any(issue["type"] == "duplicate_member_phone" for issue in dup_report["issues"]),
+        dup_report["issues"],
+    )
+    db.execute("UPDATE members SET phone = ? WHERE id = ?", ["8808001", member_b["id"]])
+    shadow_report = db.check_consistency()
+    check(
+        "自检能发现手机号抢占他人证号",
+        any(issue["type"] == "phone_shadows_card_no" for issue in shadow_report["issues"]),
+        shadow_report["issues"],
+    )
+    db.execute("UPDATE members SET phone = ? WHERE id = ?", ["13100009999", member_b["id"]])
+    db.init_db()
+    check(
+        "还原后唯一索引已重建",
+        bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_members_phone_unique'")),
+    )
+    final_report = db.check_consistency()
+    check(
+        "无重复手机号与身份遮蔽",
+        not [
+            issue
+            for issue in final_report["issues"]
+            if issue["type"]
+            in {"duplicate_member_phone", "phone_shadows_card_no", "member_identifier_shadows_admin"}
+        ],
+        final_report["issues"],
+    )
+
+    print("\n=== 23F. 重复在借的体检与修复 ===")
+    probe_book = db.execute(
+        "INSERT INTO books (isbn, title, category, total_copies, available_copies) "
+        "VALUES ('8801234567890', '重复在借探针', '测试', 2, 0)"
+    )
+    probe_member = db.execute(
+        "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+        "VALUES ('8808009', '重复在借读者', '学生', 'active', 5)"
+    )
+    db.execute("DROP INDEX IF EXISTS idx_loans_open_unique")
+    near_due = timeutil.to_str(timeutil.now())
+    first_loan = db.execute(
+        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at) VALUES (?, ?, ?, ?)",
+        [probe_book, probe_member, near_due, near_due],
+    )
+    second_loan = db.execute(
+        "INSERT INTO loans (book_id, member_id, borrowed_at, due_at) VALUES (?, ?, ?, ?)",
+        [probe_book, probe_member, near_due, near_due],
+    )
+
+    dirty = db.check_consistency()
+    check(
+        "体检能发现重复在借",
+        any(
+            issue["type"] == "duplicate_open_loan" and issue["book_id"] == probe_book
+            for issue in dirty["issues"]
+        ),
+        dirty["issues"],
+    )
+    check("存在问题时体检结论为不通过", dirty["ok"] is False)
+
+    fixed = db.repair_consistency()
+    check("修复 1 条重复在借", fixed["closed_loans"] == 1, fixed["closed_loans"])
+    check("修复后体检通过", fixed["after"]["ok"] is True, fixed["after"]["issues"])
+    survivors = db.query_all(
+        "SELECT id FROM loans WHERE book_id = ? AND member_id = ? AND returned_at IS NULL",
+        [probe_book, probe_member],
+    )
+    check("保留最早的一条在借记录", [row["id"] for row in survivors] == [first_loan], survivors)
+    closed_row = db.query_one("SELECT returned_at FROM loans WHERE id = ?", [second_loan])
+    check("多余记录被标记为已归还", closed_row["returned_at"] is not None, closed_row)
+    check(
+        "库存同步补回 1 册",
+        db.query_scalar("SELECT available_copies FROM books WHERE id = ?", [probe_book]) == 1,
+    )
+    check(
+        "修复后重复在借唯一索引已补建",
+        bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_loans_open_unique'")),
+    )
+    again_fixed = db.repair_consistency()
+    check(
+        "重复修复幂等（无事可做也不报错）",
+        again_fixed["closed_loans"] == 0 and again_fixed["after"]["ok"] is True,
+        again_fixed,
+    )
+
     print("\n=== 24. 老库升级：条码与简介自动补齐 ===")
     import sqlite3  # noqa: PLC0415 - 仅本段使用
 
@@ -619,6 +1128,8 @@ def main() -> int:
         );
         INSERT INTO books (isbn, title, author, category) VALUES ('9787506365437', '活着', '余华', '文学');
         INSERT INTO books (isbn, title, author, category) VALUES ('9787111111111', '库内自有书目', '某作者', '计算机');
+        INSERT INTO books (isbn, title, author, category, total_copies, available_copies)
+        VALUES ('9787000000001', '库存越界存量书', '某作者', '测试', 2, 5);
         """
     )
     raw.commit()
@@ -633,6 +1144,14 @@ def main() -> int:
             "条码唯一索引已创建",
             bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_books_barcode'")),
         )
+        repaired = db.query_one(
+            "SELECT total_copies, available_copies FROM books WHERE isbn = '9787000000001'"
+        )
+        check(
+            "老库越界库存被自动夹回总册数",
+            repaired["available_copies"] == repaired["total_copies"],
+            repaired,
+        )
         after = {row["isbn"]: row for row in db.query_all("SELECT isbn, barcode, description FROM books")}
         check("启动即自动回填演示简介", len(after["9787506365437"]["description"]) > 20, after["9787506365437"])
         check("非演示书保持空简介", after["9787111111111"]["description"] == "", after["9787111111111"])
@@ -643,6 +1162,433 @@ def main() -> int:
             [row["barcode"] for row in db.query_all("SELECT barcode FROM books ORDER BY id")]
             == [row["barcode"] for row in legacy_rows],
         )
+
+    print("\n=== 25. 演示数据生成器：不再造出重复在借 ===")
+    seeded_path = os.path.join(tmp_dir, "seeded.db")
+    seeded_app = build_app(seeded_path)
+    with seeded_app.app_context():
+        check("演示数据写入成功", seed_module.seed(force=True) is True)
+        seeded_report = db.check_consistency()
+        check(
+            "演示库体检通过（库存对账一致、无重复在借）",
+            seeded_report["ok"],
+            seeded_report["issues"],
+        )
+        dup_pairs = db.query_all(
+            "SELECT book_id, member_id, COUNT(*) AS n FROM loans WHERE returned_at IS NULL "
+            "GROUP BY book_id, member_id HAVING n > 1"
+        )
+        check("演示数据无「同一读者同一本书」重复在借", not dup_pairs, dup_pairs)
+        check(
+            "演示库已建立重复在借唯一索引",
+            bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_loans_open_unique'")),
+        )
+
+    print("\n=== 26. 罚金封顶与逾期口径统一 ===")
+    from library import fine as fine_module  # noqa: PLC0415 - 仅本段使用
+    from library.auth.passwords import hash_password  # noqa: PLC0415 - 仅本段使用
+
+    cfg_now = get_config()
+    per_day = cfg_now.fine_per_day
+    cap = cfg_now.fine_cap
+    long_days, mid_days = 200, 10
+    cap_amount = round(cap, 2)
+    raw_long = round(long_days * per_day, 2)
+    check(
+        "前提：默认配置下 200 天罚金会被封顶截断",
+        cap > 0 and raw_long > cap_amount,
+        f"cap={cap}, raw={raw_long}",
+    )
+
+    with app.app_context():
+        probe_member = db.execute(
+            "INSERT INTO members (card_no, name, member_type, status, max_borrow) "
+            "VALUES ('FINE0001', '罚金探针', '学生', 'active', 5)"
+        )
+        today_midnight = timeutil.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        plan = [
+            ("long", timeutil.to_str(timeutil.now() - timedelta(days=long_days))),
+            ("mid", timeutil.to_str(timeutil.now() - timedelta(days=mid_days))),
+            # 应还「今天」且时刻已过：旧口径会判成「逾期 0 天 / 罚金 ¥0」，新口径应判在借
+            ("today", timeutil.to_str(today_midnight)),
+        ]
+        for index, (tag, due_at) in enumerate(plan):
+            probe_book = db.execute(
+                "INSERT INTO books (isbn, title, category, total_copies, available_copies) "
+                "VALUES (?, ?, '口径测试', 1, 0)",
+                [f"9787111999{index:03d}2", f"口径探针 {tag}"],
+            )
+            db.execute(
+                "INSERT INTO loans (book_id, member_id, borrowed_at, due_at, returned_at, renew_count, note) "
+                "VALUES (?, ?, ?, ?, NULL, 0, ?)",
+                [
+                    probe_book,
+                    probe_member,
+                    timeutil.to_str(timeutil.now() - timedelta(days=300)),
+                    due_at,
+                    f"probe-{tag}",
+                ],
+            )
+
+    probe_items = api.get(
+        "/api/loans", query_string={"member_id": probe_member, "page_size": 100}
+    ).get_json()["items"]
+    by_note = {item["note"]: item for item in probe_items}
+
+    long_item = by_note.get("probe-long") or {}
+    check("逾期 200 天罚金按上限封顶", abs(float(long_item.get("fine", -1)) - cap_amount) < 1e-6, long_item)
+    check("封顶记录带 fine_capped 标记", long_item.get("fine_capped") is True, long_item)
+    check("封顶不改变真实逾期天数展示", long_item.get("overdue_days") == long_days, long_item)
+
+    mid_item = by_note.get("probe-mid") or {}
+    check(
+        "未达上限按实际天数计费",
+        abs(float(mid_item.get("fine", -1)) - round(mid_days * per_day, 2)) < 1e-6,
+        mid_item,
+    )
+    check("未封顶不带标记", mid_item.get("fine_capped") is False, mid_item)
+
+    today_item = by_note.get("probe-today") or {}
+    check("应还当天不算逾期（整日口径）", today_item.get("status") == "borrowed", today_item)
+    check(
+        "应还当天逾期天数与罚金均为 0",
+        today_item.get("overdue_days") == 0 and today_item.get("fine") == 0,
+        today_item,
+    )
+    check(
+        "不再出现「状态=逾期 但 天数=0」的矛盾记录",
+        not (today_item.get("status") == "overdue" and today_item.get("overdue_days") == 0),
+        today_item,
+    )
+
+    probe_overdue = api.get(
+        "/api/loans", query_string={"member_id": probe_member, "status": "overdue", "page_size": 100}
+    ).get_json()
+    overdue_notes = {item["note"] for item in probe_overdue["items"]}
+    check("逾期筛选命中封顶与普通逾期两笔", probe_overdue["total"] == 2, probe_overdue["total"])
+    check("逾期筛选排除「应还当天」", "probe-today" not in overdue_notes, sorted(overdue_notes))
+    check(
+        "逾期筛选内每条天数都 ≥ 1（口径自洽）",
+        all(item["overdue_days"] >= 1 for item in probe_overdue["items"]),
+        probe_overdue["items"],
+    )
+
+    overview = api.get("/api/dashboard/overview").get_json()
+    global_overdue = api.get("/api/loans", query_string={"status": "overdue", "page_size": 1}).get_json()["total"]
+    check(
+        "概览「逾期未还」与借阅逾期筛选一致（跨层同口径）",
+        int(overview["loans"]["overdue_loans"]) == global_overdue,
+        (overview["loans"]["overdue_loans"], global_overdue),
+    )
+    check(
+        "概览暴露罚金封顶策略",
+        "fine_cap" in overview["policy"] and "fine_max_days" in overview["policy"],
+        overview["policy"],
+    )
+    check("门户规则暴露罚金封顶", "fine_cap" in client.get("/api/public/overview").get_json()["rules"])
+
+    # 读者中心的汇总必须与列表逐笔相加完全一致（过去三处各算各的）
+    with app.app_context():
+        db.execute("UPDATE members SET password_hash = ? WHERE id = ?", [hash_password("probe123"), probe_member])
+    reader_client = app.test_client()
+    reader_login = reader_client.post(
+        "/api/reader/login", json={"account": "FINE0001", "password": "probe123"}
+    )
+    check("探针读者可登录读者中心", reader_login.status_code == 200, reader_login.get_json())
+    reader_me = reader_client.get("/api/reader/me").get_json()
+    expected_fine = round(sum(float(item["fine"]) for item in probe_items), 2)
+    check(
+        "读者中心累计罚金 = 列表逐笔罚金之和",
+        abs(reader_me["stats"]["fine_total"] - expected_fine) < 1e-6,
+        (reader_me["stats"]["fine_total"], expected_fine),
+    )
+    check("读者中心逾期册数与逾期筛选一致", reader_me["stats"]["overdue_loans"] == 2, reader_me["stats"])
+
+    with app.app_context():
+        check("fine：200 天取金额封顶", fine_module.fine_for_days(long_days) == cap_amount, fine_module.fine_for_days(long_days))
+        check("fine：cap=0 表示不封顶", fine_module.fine_for_days(long_days, cap=0) == raw_long, fine_module.fine_for_days(long_days, cap=0))
+        check(
+            "fine：max_days 限制最长计息天数",
+            fine_module.fine_for_days(400, max_days=100, cap=0) == round(100 * per_day, 2),
+            fine_module.fine_for_days(400, max_days=100, cap=0),
+        )
+        check("fine：0 天不产生罚金", fine_module.fine_for_days(0) == 0)
+        check(
+            "fine：is_overdue 与 overdue_days 恒等价",
+            all(
+                fine_module.is_overdue(d) == (fine_module.overdue_days(d) > 0)
+                for d in ("2020-01-01 00:00:00", "2999-01-01 00:00:00")
+            ),
+        )
+
+    print("\n=== 26B. 罚金配置校验 ===")
+    import config as fine_config  # noqa: PLC0415 - 仅本段使用
+
+    saved_fine_env = {
+        name: os.environ.get(name)
+        for name in (
+            "LIBRARY_FINE_CAP",
+            "LIBRARY_FINE_MAX_DAYS",
+            "LIBRARY_SECRET_KEY",
+            "LIBRARY_DB_PATH",
+            "LIBRARY_DEBUG",
+        )
+    }
+    try:
+        os.environ["LIBRARY_SECRET_KEY"] = "a-sufficiently-long-secret-key"
+        os.environ.pop("LIBRARY_DB_PATH", None)
+        os.environ["LIBRARY_DEBUG"] = "false"
+        os.environ["LIBRARY_FINE_CAP"] = "-1"
+        check("负数罚金上限被拒绝启动", config_rejected(fine_config))
+        os.environ["LIBRARY_FINE_CAP"] = "50"
+        os.environ["LIBRARY_FINE_MAX_DAYS"] = "99999"
+        check("超范围的最长计息天数被拒绝启动", config_rejected(fine_config))
+        os.environ["LIBRARY_FINE_MAX_DAYS"] = "0"
+        check("max_days=0 表示不限制且能正常启动", fine_config.load_config().fine_max_days == 0)
+        os.environ["LIBRARY_FINE_CAP"] = "0"
+        check("cap=0 表示不封顶且能正常启动", fine_config.load_config().fine_cap == 0.0)
+    finally:
+        for env_name, env_value in saved_fine_env.items():
+            if env_value is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = env_value
+
+    print("\n=== 27. 批量还书 ===")
+    r = api.post("/api/members", json={"card_no": "2026999", "name": "批量读者", "member_type": "学生", "status": "active"})
+    check("批量用例：创建读者 201", r.status_code == 201, r.get_json())
+    batch_member_id = r.get_json()["id"]
+
+    batch_book_ids = []
+    for i in range(3):
+        r = api.post(
+            "/api/books",
+            json={"isbn": f"9780000000{i:03d}", "title": f"批量测试书 {i + 1}", "author": "测试", "total_copies": 2},
+        )
+        batch_book_ids.append(r.get_json()["id"])
+
+    loan_ids = [
+        api.post("/api/loans/borrow", json={"book_id": bid, "member_id": batch_member_id}).get_json()["id"]
+        for bid in batch_book_ids
+    ]
+    check("批量用例：准备 3 条未归还借阅", len(loan_ids) == 3 and all(loan_ids), loan_ids)
+
+    # 1) 全部成功
+    r = api.post("/api/loans/return-batch", json={"ids": loan_ids})
+    check("批量还书 200", r.status_code == 200, r.get_json())
+    data = r.get_json()
+    check("3 册全部成功", data["succeeded_count"] == 3 and data["failed_count"] == 0, data)
+    check("逐条返回结果", len(data["succeeded"]) == 3 and len(data["failed"]) == 0, data)
+    check("逐条状态均为已归还", all(item["status"] == "returned" for item in data["succeeded"]), data["succeeded"])
+    check("库存全部回补为 2", all(api.get(f"/api/books/{bid}").get_json()["available_copies"] == 2 for bid in batch_book_ids))
+
+    # 2) 幂等：重复提交同一批
+    r = api.post("/api/loans/return-batch", json={"ids": loan_ids})
+    check("重复批量还书不报错（200）", r.status_code == 200, r.get_json())
+    check(
+        "重复批量还书全部列为未处理",
+        r.get_json()["succeeded_count"] == 0 and r.get_json()["failed_count"] == 3,
+        r.get_json(),
+    )
+    check("重复批量还书库存不再变化", all(api.get(f"/api/books/{bid}").get_json()["available_copies"] == 2 for bid in batch_book_ids))
+
+    # 3) 重复 ID 去重 + 混合提交（部分失败不影响其余）
+    fresh = api.post("/api/loans/borrow", json={"book_id": batch_book_ids[0], "member_id": batch_member_id}).get_json()
+    dup = api.post("/api/loans/return-batch", json={"ids": [fresh["id"], fresh["id"], fresh["id"]]}).get_json()
+    check("重复 ID 去重后只处理一次", dup["requested"] == 1 and dup["succeeded_count"] == 1, dup)
+
+    opened = api.post("/api/loans/borrow", json={"book_id": batch_book_ids[1], "member_id": batch_member_id}).get_json()
+    mixed = api.post("/api/loans/return-batch", json={"ids": [fresh["id"], opened["id"]]}).get_json()
+    check("混合提交：成功 1 / 未处理 1", mixed["succeeded_count"] == 1 and mixed["failed_count"] == 1, mixed)
+    check("未处理项带失败原因", bool(mixed["failed"][0].get("message")), mixed["failed"])
+
+    # 4) 参数校验
+    check("空 ids 返回 400", api.post("/api/loans/return-batch", json={"ids": []}).status_code == 400)
+    check("ids 非数组返回 400", api.post("/api/loans/return-batch", json={"ids": "1"}).status_code == 400)
+    check("ids 含非正整数返回 400", api.post("/api/loans/return-batch", json={"ids": [-1]}).status_code == 400)
+    check("超过单次上限返回 400", api.post("/api/loans/return-batch", json={"ids": list(range(1, 203))}).status_code == 400)
+    check("不存在的 ID 计入未处理", api.post("/api/loans/return-batch", json={"ids": [999999]}).get_json()["failed_count"] == 1)
+
+    # 5) 罚款合计 = 逐笔之和（逾期记录批量归还）
+    with app.app_context():
+        overdue_ids = []
+        for bid in batch_book_ids[1:]:
+            db.execute(
+                "INSERT INTO loans (book_id, member_id, borrowed_at, due_at, returned_at, renew_count, note) "
+                "VALUES (?, ?, ?, ?, NULL, 0, '')",
+                [
+                    bid,
+                    batch_member_id,
+                    timeutil.to_str(timeutil.now() - timedelta(days=40)),
+                    timeutil.to_str(timeutil.now() - timedelta(days=10)),
+                ],
+            )
+            db.execute("UPDATE books SET available_copies = available_copies - 1 WHERE id = ?", [bid])
+            overdue_ids.append(int(db.query_scalar("SELECT last_insert_rowid()")))
+    batch_overdue = api.post("/api/loans/return-batch", json={"ids": overdue_ids}).get_json()
+    expected_fine = round(sum(float(x["fine"]) for x in batch_overdue["succeeded"]), 2)
+    check(
+        "批量罚金合计 = 逐笔罚金之和",
+        abs(batch_overdue["fine_total"] - expected_fine) < 1e-6,
+        (batch_overdue["fine_total"], expected_fine),
+    )
+    check("2 笔逾期 10 天罚金合计 ¥10", batch_overdue["fine_total"] == 10.0, batch_overdue["fine_total"])
+
+    # 6) 鉴权与 CSRF（client 已登录；anon_client 全新会话）
+    anon_client = app.test_client()
+    check("未登录批量还书返回 401", anon_client.post("/api/loans/return-batch", json={"ids": [1]}).status_code == 401)
+    check("已登录但缺 CSRF 头返回 403", client.post("/api/loans/return-batch", json={"ids": [1]}).status_code == 403)
+
+    print("\n=== 27B. 前端资源契约（批量还书 / 路由持久化 / 加载态） ===")
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "templates" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    css = (root / "static" / "css" / "app.css").read_text(encoding="utf-8")
+    check("借阅工具栏含批量还书按钮", 'id="loanReturnBatch"' in html)
+    check("前端调用批量还书端点", "/api/loans/return-batch" in js)
+    check("批量还书入口已绑定", "openBatchReturn" in js)
+    check("监听 hashchange（前进/后退可切视图）", 'addEventListener("hashchange"' in js)
+    check("筛选条件持久化到 URL", "history.replaceState" in js)
+    check("空列表提供清除筛选出口", "data-clear" in js and "emptyState" in js)
+    check("表单报错聚焦出错字段", "scrollIntoView" in js)
+    check("样式含加载态与勾选列", "is-loading" in css and "th.pick" in css)
+
+    print("\n=== 28. 列表排序、续借口径与错误细分 ===")
+
+    # ---- 28.1 列表排序：白名单生效、非法值回落、方向兜底 ----
+    def page_items(path, **params):
+        payload = api.get(path, query_string={"page_size": 50, **params}).get_json()
+        return payload["items"]
+
+    titles_asc = [b["title"] for b in page_items("/api/books", sort="title", order="asc")]
+    titles_desc = [b["title"] for b in page_items("/api/books", sort="title", order="desc")]
+    check("图书按书名升序生效", len(titles_asc) > 1 and titles_asc == sorted(titles_asc, key=str.lower), titles_asc[:3])
+    check("图书按书名降序 = 升序的反向", titles_desc == list(reversed(titles_asc)), titles_desc[:3])
+
+    stock_asc = [int(b["available_copies"]) for b in page_items("/api/books", sort="available_copies", order="asc")]
+    check("图书按可借数升序生效", stock_asc == sorted(stock_asc), stock_asc[:5])
+
+    r = api.get("/api/books", query_string={"sort": "id); DROP TABLE books; --", "order": "asc"})
+    check("非法排序键被白名单拒绝且不报错", r.status_code == 200 and r.get_json()["total"] > 0, r.status_code)
+    r = api.get("/api/books", query_string={"sort": "title", "order": "'; DROP TABLE books; --"})
+    check("非法排序方向回落为降序", r.get_json()["items"][0]["title"] == titles_desc[0], r.get_json()["items"][0]["title"])
+
+    names_asc = [m["name"] for m in page_items("/api/members", sort="name", order="asc")]
+    check("读者按姓名升序生效", names_asc == sorted(names_asc, key=str.lower), names_asc[:3])
+    names_desc = [m["name"] for m in page_items("/api/members", sort="name", order="desc")]
+    check("读者按姓名降序生效", names_desc == list(reversed(names_asc)), names_desc[:3])
+
+    dues_asc = [row["due_at"] for row in page_items("/api/loans", sort="due_at", order="asc", status="open")]
+    check("借阅按应还日期升序生效", dues_asc == sorted(dues_asc), dues_asc[:3])
+    default_items = page_items("/api/loans", status="all")
+    check(
+        "不传排序参数时保持默认顺序（未归还优先）",
+        bool(default_items) and default_items[0]["status"] != "returned",
+        default_items[0]["status"] if default_items else None,
+    )
+
+    # ---- 28.2 续借口径：列表的 can_renew 与真实闸门一致（冻结读者不可续借） ----
+    r = api.post("/api/members", json={"card_no": "2026888", "name": "续借口径读者", "member_type": "学生", "status": "active"})
+    freeze_member_id = r.get_json()["id"]
+    r = api.post("/api/books", json={"isbn": "9780000000901", "title": "续借口径测试书", "total_copies": 1})
+    freeze_book_id = r.get_json()["id"]
+    loan = api.post("/api/loans/borrow", json={"book_id": freeze_book_id, "member_id": freeze_member_id}).get_json()
+    freeze_loan_id = loan["id"]
+    check("新建借阅默认可续借", loan["can_renew"] is True, loan.get("can_renew"))
+
+    # 业务规则：有未还借阅的读者不允许被冻结（接口层拦截，返回 409）。
+    r = api.put(f"/api/members/{freeze_member_id}", json={
+        "card_no": "2026888", "name": "续借口径读者", "member_type": "学生", "status": "frozen",
+    })
+    check("有未还借阅时接口拒绝冻结（业务规则 409）", r.status_code == 409, (r.status_code, r.get_json()))
+
+    # 接口拿不到「在借又冻结」的组合，这里直接落库构造该状态，才能真正验证续借闸门。
+    with app.app_context():
+        db.execute("UPDATE members SET status='frozen' WHERE id=?", [freeze_member_id])
+    frozen_row = next(
+        (row for row in page_items("/api/loans", keyword="续借口径测试书", status="open") if row["id"] == freeze_loan_id),
+        None,
+    )
+    check("冻结读者后列表 can_renew 变为 False", frozen_row is not None and frozen_row["can_renew"] is False, frozen_row and frozen_row.get("can_renew"))
+    check("冻结读者续借返回 422", api.post(f"/api/loans/{freeze_loan_id}/renew").status_code == 422)
+
+    with app.app_context():
+        db.execute("UPDATE members SET status='active' WHERE id=?", [freeze_member_id])
+    thawed_row = next(
+        (row for row in page_items("/api/loans", keyword="续借口径测试书", status="open") if row["id"] == freeze_loan_id),
+        None,
+    )
+    check("恢复后 can_renew 又变回 True", thawed_row is not None and thawed_row["can_renew"] is True, thawed_row and thawed_row.get("can_renew"))
+    check("恢复后续借成功", api.post(f"/api/loans/{freeze_loan_id}/renew").status_code == 200)
+
+    # ---- 28.3 IntegrityError 细分：不再一律说「唯一字段重复」 ----
+    integrity_handler = None
+    for _bp, mapping in app.error_handler_spec.items():
+        for _code, exc_map in (mapping or {}).items():
+            if sqlite3.IntegrityError in exc_map:
+                integrity_handler = exc_map[sqlite3.IntegrityError]
+    check("注册了 IntegrityError 处理器", integrity_handler is not None)
+
+    def integrity_response(errorname: str):
+        exc = sqlite3.IntegrityError("boom")
+        exc.sqlite_errorname = errorname
+        with app.test_request_context("/api/books", method="POST"):
+            response, status = integrity_handler(exc)
+            return status, response.get_json()["error"]
+
+    status, err = integrity_response("SQLITE_CONSTRAINT_UNIQUE")
+    check("UNIQUE 违规 → 409 且指向唯一字段", status == 409 and "唯一" in err["message"], (status, err))
+    status, err = integrity_response("SQLITE_CONSTRAINT_NOTNULL")
+    check("NOT NULL 违规 → 400 且提示必填缺失", status == 400 and "必填" in err["message"], (status, err))
+    status, err = integrity_response("SQLITE_CONSTRAINT_CHECK")
+    check("CHECK 违规 → 400 且提示一致性约束", status == 400 and "一致性" in err["message"], (status, err))
+    status, err = integrity_response("SQLITE_CONSTRAINT_FOREIGNKEY")
+    check("外键违规 → 409", status == 409, (status, err))
+
+    # ---- 28.4 ISBN 校验位：只做提示不阻断保存 ----
+    check("合法 ISBN-13 判定为 ok", isbn_check("9787506365437") == "ok", isbn_check("9787506365437"))
+    check("带连字符的合法 ISBN-13 判定为 ok", isbn_check("978-7-506-36543-7") == "ok")
+    check("合法 ISBN-10 判定为 ok", isbn_check("0306406152") == "ok", isbn_check("0306406152"))
+    check("以 X 结尾的合法 ISBN-10 判定为 ok", isbn_check("097522980X") == "ok", isbn_check("097522980X"))
+    check("校验位错误的 ISBN-13 判定为 invalid_checksum", isbn_check("9787111111111") == "invalid_checksum", isbn_check("9787111111111"))
+    check("长度不合法的 ISBN 判定为 unknown_format", isbn_check("123") == "unknown_format", isbn_check("123"))
+    r = api.post("/api/books", json={"isbn": "9780000000777", "title": "校验位提示测试书", "total_copies": 1})
+    check("校验位不规范的 ISBN 仍可保存（提示而非阻断）", r.status_code == 201, r.get_json())
+    check("图书详情回带 isbn_check 字段", r.get_json()["isbn_check"] == "invalid_checksum", r.get_json().get("isbn_check"))
+
+    print("\n=== 28B. 前端资源契约（排序 / 焦点陷阱 / 标签打印 / 移动端 / 错误兜底） ===")
+    root2 = Path(__file__).resolve().parent.parent
+    js2 = (root2 / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    css2 = (root2 / "static" / "css" / "app.css").read_text(encoding="utf-8")
+    html2 = (root2 / "templates" / "index.html").read_text(encoding="utf-8")
+    public_html = (root2 / "templates" / "public.html").read_text(encoding="utf-8")
+    check("表头排序已实现", "sortHeader" in js2 and "data-sort" in js2 and "toggleSort" in js2)
+    check("排序状态写入 URL", 'params.set("sort"' in js2 and 'params.get("sort")' in js2)
+    check("弹窗焦点陷阱已实现", "trapTab" in js2 and 'e.key === "Tab"' in js2)
+    check("关闭弹窗后焦点归位", "lastFocusedElement" in js2)
+    check("表单 label 与控件建立关联", "linkLabels" in js2 and 'setAttribute("for"' in js2)
+    check("弹窗声明 dialog 语义", 'role="dialog"' in html2 and 'aria-modal="true"' in html2)
+    check("标签打印支持份数与尺寸", "LABEL_SIZES" in js2 and "openLabelDialog" in js2)
+    check("标签打印按份数平铺", "print-layer" in css2 and "break-inside: avoid" in css2)
+    check("移动端媒体查询已就位", "@media (max-width: 900px)" in css2 and "@media (max-width: 560px)" in css2)
+    check("全局未捕获错误兜底", "unhandledrejection" in js2 and "reportGlobalError" in js2)
+    check("5xx 错误附带后端错误编号", "request_id" in js2 and "错误编号" in js2)
+    check("门户不再公开初始密码推导规则", "证号后 6 位" not in public_html and "初始密码由馆员告知" in public_html)
+    check("可排序表头有可点击样式", "th.sortable" in css2)
+
+    print("\n=== 28C. 会话到期提醒 ===")
+    r = client.get("/api/auth/me")
+    check("已登录时 /api/auth/me 回带会话信息", r.status_code == 200 and "session" in r.get_json(), r.get_json())
+    sess = (r.get_json() or {}).get("session") or {}
+    check("会话时长与配置一致（秒）", sess.get("lifetime_seconds") == 8 * 3600, sess)
+    check("会话是滑动续期（前端据此按闲置时长判断）", sess.get("refresh_on_request") is True, sess)
+
+    check("页面含会话过期横幅", 'id="sessionBanner"' in html2 and 'id="sessionBannerBtn"' in html2, None)
+    check("会话横幅有独立警示样式", ".alert-warn" in css2)
+    check("闲置到期提醒逻辑已实现", "sessionWatch" in js2 and "SESSION_WARN_BEFORE" in js2)
+    check("成功请求会刷新闲置计时", "sessionWatch.touch()" in js2)
+    check("保持登录 / 重新登录出口齐备", '"keepalive"' in js2 and '"relogin"' in js2)
+    check("加载会话后启动到期监视", "sessionWatch.start(" in js2)
 
     print(f"\n{'=' * 46}\n结果：{PASSED} 项通过，{FAILED} 项失败\n{'=' * 46}")
     return 0 if FAILED == 0 else 1

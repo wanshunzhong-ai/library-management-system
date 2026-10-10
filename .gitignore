@@ -15,6 +15,8 @@ data/*.db-wal
 data/*.db-shm
 # 本地环境变量（含密钥）
 .env
+# 未配置 LIBRARY_SECRET_KEY 时自动生成的会话密钥，每套部署一份，切勿入库
+.secret_key
 
 # ---- 本地工具与预览产物 ----
 .preview/

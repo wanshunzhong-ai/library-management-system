@@ -15,13 +15,6 @@ from library.auth import service
 bp = Blueprint("auth", __name__)
 
 
-def _client_ip() -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "-"
-
-
 @bp.get("/login")
 def login_page():
     """兼容旧链接：登录入口已统一到首页。"""
@@ -37,7 +30,7 @@ def login_page():
 def login():
     """统一登录：一份账号密码，自动识别管理员或读者。"""
     payload = request.get_json(silent=True) or {}
-    return jsonify(service.login_unified(payload, _client_ip()))
+    return jsonify(service.login_unified(payload, service.client_ip()))
 
 
 @bp.post("/api/auth/logout")
@@ -57,6 +50,22 @@ def me():
             "admin": admin,
             "csrf_token": service.csrf_token(),
             "library": {"name": cfg.library_name, "slogan": cfg.library_slogan},
+            "security": service.security_status(admin),
+            # 会话信息：前端据此在到期前给出「即将过期」提醒，避免弹窗里未保存的表单无声丢失。
+            # refresh_on_request=True 表示后端是滑动续期（任意请求都会重置 Cookie 有效期），
+            # 因此前端按「最后一次成功请求」起算闲置时长即可。
+            "session": {
+                "lifetime_seconds": int(service.session_lifetime().total_seconds()),
+                "refresh_on_request": True,
+            },
+            # 借阅策略：侧栏在任意视图刷新后都能显示，不必先进概览
+            "policy": {
+                "loan_days": cfg.loan_days,
+                "max_renew": cfg.max_renew,
+                "fine_per_day": cfg.fine_per_day,
+                "fine_max_days": cfg.fine_max_days,
+                "fine_cap": cfg.fine_cap,
+            },
         }
     )
 
