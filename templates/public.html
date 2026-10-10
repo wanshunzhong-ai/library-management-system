@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ library_name }} · 馆藏检索</title>
+  <meta name="description" content="{{ library_name }}读者门户：馆藏检索、新书推荐与借阅规则查询。" />
+  <link rel="stylesheet" href="/static/css/site.css" />
+  <link rel="stylesheet" href="/static/css/public.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark">图</span>
+        <span class="brand-text">
+          <strong>{{ library_name }}</strong>
+          <small>LIBRARY PORTAL</small>
+        </span>
+      </a>
+      <nav class="site-nav">
+        <a href="#search">馆藏检索</a>
+        <a href="#recommend">馆藏推荐</a>
+        <a href="#rules">借阅规则</a>
+        <a href="#about">关于本馆</a>
+      </nav>
+      <a class="btn btn-ghost admin-entry" href="/login">
+        <span class="lock">🔒</span> 管理员登录
+      </a>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="wrap">
+      <p class="hero-eyebrow">{{ library_slogan }}</p>
+      <h1 class="hero-title">找一本书，从这里开始</h1>
+      <p class="hero-sub">
+        输入书名、作者或 ISBN，即可查询这本书是否在馆、还剩几册可借、在哪个书架。
+      </p>
+
+      <form class="searchbar" id="searchForm" autocomplete="off">
+        <span class="searchbar-ico" aria-hidden="true">⌕</span>
+        <input id="q" type="search" placeholder="例如：活着 / 余华 / 9787506365437" aria-label="检索馆藏" />
+        <select id="categoryFilter" aria-label="分类筛选">
+          <option value="">全部分类</option>
+        </select>
+        <label class="switch"><input type="checkbox" id="availableOnly" /> 仅看可借</label>
+        <button class="btn btn-primary" type="submit">检索</button>
+      </form>
+
+      <div class="chips" id="quickChips"></div>
+    </div>
+  </section>
+
+  <section class="wrap statbar" id="statBar"></section>
+
+  <section class="wrap section" id="search">
+    <div class="section-head">
+      <h2>检索结果</h2>
+      <span class="section-note" id="searchSummary">输入关键词开始检索</span>
+    </div>
+    <div class="card" id="searchCard">
+      <div class="empty-state" id="searchEmpty">
+        <div class="empty-ico">🔍</div>
+        <p>还没有检索内容</p>
+        <small>试试搜索「计算机」「余华」或出版社名称</small>
+      </div>
+      <div class="table-scroll" id="searchResultWrap" hidden>
+        <table class="table" id="searchTable"></table>
+      </div>
+      <div class="pager" id="searchPager" hidden></div>
+    </div>
+  </section>
+
+  <section class="wrap section" id="recommend">
+    <div class="section-head">
+      <h2>馆藏推荐</h2>
+      <span class="section-note">按借阅热度挑选，当前均有可借库存</span>
+    </div>
+    <div class="cards" id="recommendCards"></div>
+  </section>
+
+  <section class="wrap section">
+    <div class="section-head">
+      <h2>新书上架</h2>
+      <span class="section-note">最近入藏的图书</span>
+    </div>
+    <div class="cards" id="newCards"></div>
+  </section>
+
+  <section class="wrap section" id="rules">
+    <div class="section-head">
+      <h2>借阅规则</h2>
+      <span class="section-note">到馆办理，凭读者证借还</span>
+    </div>
+    <div class="rule-grid" id="ruleGrid"></div>
+  </section>
+
+  <section class="wrap section" id="about">
+    <div class="about">
+      <div class="about-text">
+        <h2>关于本馆</h2>
+        <p>
+          {{ library_name }}是一座面向公众开放的综合性图书馆，馆藏覆盖文学、历史、经济、科普与计算机等门类，
+          提供开架借阅、馆内阅览与信息咨询服务。
+        </p>
+        <p>
+          本页面为读者自助查询入口：无需登录即可检索馆藏、查看在架情况与馆藏位置。
+          图书的借还办理、读者档案维护与流通统计由馆员在后台系统中完成，后台仅对工作人员开放。
+        </p>
+        <ul class="about-list">
+          <li><b>开馆时间</b>周一至周日 09:00 – 21:00（法定节假日以公告为准）</li>
+          <li><b>服务电话</b>0571-8888 6666</li>
+          <li><b>馆舍地址</b>星海市文汇区书香路 18 号</li>
+        </ul>
+      </div>
+      <div class="about-card">
+        <h3>读者须知</h3>
+        <ol>
+          <li>凭本人读者证进馆借阅，证件仅限本人使用。</li>
+          <li>检索结果中的「在架」状态实时更新，到馆后如遇他人同时借阅，请以书库实际在架为准。</li>
+          <li>请按期归还，逾期将按日计算滞纳金。</li>
+          <li>图书污损或遗失，需按规定赔偿。</li>
+        </ol>
+        <a class="btn btn-outline" href="/login">工作人员入口</a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <span>© 2026 {{ library_name }}</span>
+      <span class="dot">·</span>
+      <span>馆藏检索系统</span>
+      <span class="footer-spacer"></span>
+      <a href="/login">管理员登录</a>
+    </div>
+  </footer>
+
+  <div class="toast-layer" id="toastLayer"></div>
+  <script src="/static/js/public.js"></script>
+</body>
+</html>

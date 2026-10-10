@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---- 本地数据与环境 ----
+# SQLite 数据库（含 WAL/SHM 临时文件）：运行时生成，不入库
+data/*.db
+data/*.db-wal
+data/*.db-shm
+# 本地环境变量（含密钥）
+.env
+
+# ---- 本地工具与预览产物 ----
+.preview/
+.workbuddy/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

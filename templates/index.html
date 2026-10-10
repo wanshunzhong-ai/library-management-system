@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>图书管理系统</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">图</div>
+        <div class="brand-text">
+          <strong>图书管理系统</strong>
+          <span>后台控制台</span>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item is-active" data-view="dashboard"><span class="nav-ico">▦</span>概览</button>
+        <button class="nav-item" data-view="books"><span class="nav-ico">▤</span>图书管理</button>
+        <button class="nav-item" data-view="members"><span class="nav-ico">◍</span>读者管理</button>
+        <button class="nav-item" data-view="loans"><span class="nav-ico">⇄</span>借阅管理</button>
+      </nav>
+      <div class="sidebar-foot" id="policyBox">
+        <div class="policy-row"><span>借期</span><b id="policyDays">—</b></div>
+        <div class="policy-row"><span>可续借</span><b id="policyRenew">—</b></div>
+        <div class="policy-row"><span>逾期罚金</span><b id="policyFine">—</b></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">概览</h1>
+          <p class="page-sub" id="pageSub">馆藏与流通实时概况</p>
+        </div>
+        <div class="topbar-actions" id="topbarActions">
+          <a class="btn ghost" href="/" target="_blank" rel="noopener">读者门户 ↗</a>
+          <button class="btn ghost" id="changePwdBtn">修改密码</button>
+          <div class="admin-chip">
+            <span class="avatar" id="adminAvatar">管</span>
+            <span class="admin-meta">
+              <b id="adminName">{{ (admin_name.display_name if admin_name else '管理员') }}</b>
+              <small id="adminRole">后台管理员</small>
+            </span>
+          </div>
+          <button class="btn" id="logoutBtn">退出登录</button>
+        </div>
+      </header>
+
+      <section class="view is-active" id="view-dashboard">
+        <div class="stat-grid" id="statGrid"></div>
+        <div class="panel-grid">
+          <div class="card">
+            <div class="card-head"><h2>借阅趋势</h2><span class="hint" id="trendHint">近 14 天</span></div>
+            <div class="chart-wrap" id="trendChart"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>分类借阅排行</h2></div>
+            <div class="bars" id="categoryBars"></div>
+          </div>
+        </div>
+        <div class="panel-grid">
+          <div class="card">
+            <div class="card-head"><h2>逾期提醒</h2><button class="link-btn" data-jump="loans" data-status="overdue">查看全部</button></div>
+            <div class="table-scroll"><table class="table" id="overdueTable"></table></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>热门图书</h2></div>
+            <div class="rank-list" id="hotBooks"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="view-books">
+        <div class="toolbar">
+          <div class="search">
+            <input id="bookKeyword" type="search" placeholder="搜索书名 / 作者 / ISBN / 出版社" />
+          </div>
+          <select id="bookCategory" class="select"></select>
+          <label class="check"><input type="checkbox" id="bookAvailableOnly" /> 仅看可借</label>
+          <button class="btn ghost" id="bookReset">重置</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="bookCreate">+ 新增图书</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="bookTable"></table></div>
+          <div class="pager" id="bookPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-members">
+        <div class="toolbar">
+          <div class="search">
+            <input id="memberKeyword" type="search" placeholder="搜索姓名 / 证号 / 手机号" />
+          </div>
+          <select id="memberStatus" class="select">
+            <option value="">全部状态</option>
+            <option value="active">正常</option>
+            <option value="frozen">已冻结</option>
+          </select>
+          <button class="btn ghost" id="memberReset">重置</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="memberCreate">+ 新增读者</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="memberTable"></table></div>
+          <div class="pager" id="memberPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-loans">
+        <div class="toolbar">
+          <div class="tabs" id="loanTabs">
+            <button class="tab is-active" data-status="all">全部</button>
+            <button class="tab" data-status="borrowed">在借</button>
+            <button class="tab" data-status="overdue">逾期</button>
+            <button class="tab" data-status="returned">已归还</button>
+          </div>
+          <div class="search">
+            <input id="loanKeyword" type="search" placeholder="搜索书名 / 读者 / 证号" />
+          </div>
+          <button class="btn ghost" id="loanReset">重置</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="loanBorrow">+ 办理借书</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="loanTable"></table></div>
+          <div class="pager" id="loanPager"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-layer" id="modalLayer" hidden>
+    <div class="modal" id="modal">
+      <div class="modal-head">
+        <h3 id="modalTitle">标题</h3>
+        <button class="icon-btn" id="modalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot" id="modalFoot"></div>
+    </div>
+  </div>
+
+  <div class="toast-layer" id="toastLayer"></div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
