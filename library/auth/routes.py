@@ -1,8 +1,13 @@
-"""登录 / 登出 / 会话信息接口。"""
+"""统一登录接口与会话信息接口。
+
+登录入口只有首页 `/` 一处：`/login` 仅作兼容跳转，不再单独渲染登录页。
+"""
 
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, render_template, request
+from urllib.parse import quote
+
+from flask import Blueprint, jsonify, redirect, request, url_for
 
 from config import get_config
 from library.auth import service
@@ -19,23 +24,20 @@ def _client_ip() -> str:
 
 @bp.get("/login")
 def login_page():
-    if service.current_admin() is not None:
-        from flask import redirect, url_for
-
-        return redirect(url_for("admin_console"))
-    cfg = get_config()
-    return render_template(
-        "login.html",
-        library_name=cfg.library_name,
-        library_slogan=cfg.library_slogan,
-    )
+    """兼容旧链接：登录入口已统一到首页。"""
+    target = url_for("public.home")
+    nxt = (request.args.get("next") or "").strip()
+    # 只透传站内相对路径，避免开放重定向
+    if nxt.startswith("/") and not nxt.startswith("//"):
+        target = f"{target}?next={quote(nxt)}"
+    return redirect(target)
 
 
 @bp.post("/api/auth/login")
 def login():
+    """统一登录：一份账号密码，自动识别管理员或读者。"""
     payload = request.get_json(silent=True) or {}
-    result = service.login(payload, _client_ip())
-    return jsonify(result)
+    return jsonify(service.login_unified(payload, _client_ip()))
 
 
 @bp.post("/api/auth/logout")

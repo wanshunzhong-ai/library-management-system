@@ -89,7 +89,7 @@ class Api:
 
 
 def main() -> int:
-    auth_service._attempts.clear()
+    auth_service.login_throttle.reset()
     tmp_dir = tempfile.mkdtemp(prefix="library-smoke-")
     db_path = os.path.join(tmp_dir, "test.db")
     app = build_app(db_path)
@@ -100,13 +100,16 @@ def main() -> int:
     check("GET /health 返回 200", client.get("/health").status_code == 200)
     check("GET /ready 返回 200", client.get("/ready").status_code == 200)
 
-    print("\n=== 2. 读者门户（免登录） ===")
+    print("\n=== 2. 统一登录页（首页） ===")
     r = client.get("/")
     body = r.get_data(as_text=True)
     check("首页可访问", r.status_code == 200, r.status_code)
     check("首页含馆名", "测试图书馆" in body, body[:80])
-    check("首页含检索框", 'id="searchForm"' in body)
-    check("首页含管理员入口", "/login" in body)
+    check("首页即统一登录表单", 'id="portalLoginForm"' in body)
+    check("首页登录框同时服务读者与馆员", "借书证号 / 手机号 / 工作账号" in body)
+    check("首页仍保留馆藏检索", 'id="searchForm"' in body)
+    check("首页保留推荐与规则区块", 'id="recommendCards"' in body and 'id="ruleGrid"' in body)
+    check("首页不再有独立的管理员登录链接", 'href="/login"' not in body)
 
     r = client.get("/api/public/overview")
     check("门户概览免登录可访问", r.status_code == 200, r.status_code)
@@ -130,22 +133,35 @@ def main() -> int:
     check("GET /api/dashboard/overview 未登录 401", client.get("/api/dashboard/overview").status_code == 401)
     check("POST /api/loans/borrow 未登录 401", client.post("/api/loans/borrow", json={}).status_code == 401)
     r = client.get("/admin")
-    check("GET /admin 未登录跳转登录页", r.status_code == 302 and "/login" in r.headers.get("Location", ""), r.headers.get("Location"))
+    check(
+        "GET /admin 未登录跳统一登录页",
+        r.status_code == 302 and r.headers.get("Location", "").startswith("/?next="),
+        r.headers.get("Location"),
+    )
+    r = client.get("/reader")
+    check(
+        "GET /reader 未登录跳统一登录页",
+        r.status_code == 302 and r.headers.get("Location", "").startswith("/?next="),
+        r.headers.get("Location"),
+    )
     r = client.get("/api/auth/me")
     check("未登录 /api/auth/me 返回 401", r.status_code == 401, r.status_code)
 
-    print("\n=== 4. 登录 ===")
-    r = client.post("/api/auth/login", json={"username": ADMIN_USER, "password": "wrong-password"})
+    print("\n=== 4. 统一登录（自动识别身份） ===")
+    r = client.post("/api/auth/login", json={"identifier": ADMIN_USER, "password": "wrong-password"})
     check("密码错误返回 401", r.status_code == 401, r.status_code)
-    check("错误信息统一", r.get_json()["error"]["message"] == "用户名或密码不正确", r.get_json())
-    check("失败信息不泄露用户是否存在", "不存在" not in r.get_json()["error"]["message"], r.get_json())
+    check("错误信息统一", r.get_json()["error"]["message"] == "账号或密码不正确", r.get_json())
+    check("失败信息不泄露账号是否存在", "不存在" not in r.get_json()["error"]["message"], r.get_json())
 
-    r = client.post("/api/auth/login", json={"username": ADMIN_USER, "password": ""})
+    r = client.post("/api/auth/login", json={"identifier": ADMIN_USER, "password": ""})
     check("空密码返回 400", r.status_code == 400, r.status_code)
+    check("空账号返回 400", client.post("/api/auth/login", json={"password": "x"}).status_code == 400)
 
     r = client.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD})
-    check("正确密码登录 200", r.status_code == 200, r.get_json())
+    check("管理员登录 200（兼容 username 字段）", r.status_code == 200, r.get_json())
     login = r.get_json()
+    check("自动识别为管理员身份", login.get("role") == "admin", login)
+    check("管理员落点为后台控制台", login.get("redirect") == "/admin", login)
     check("登录返回管理员信息", login["admin"]["username"] == ADMIN_USER, login)
     check("登录返回 CSRF token", bool(login.get("csrf_token")), login)
     api.csrf = login["csrf_token"]
@@ -157,6 +173,27 @@ def main() -> int:
     r = client.get("/admin")
     check("登录后可进入后台控制台", r.status_code == 200, r.status_code)
     check("后台页面含退出按钮", 'id="logoutBtn"' in r.get_data(as_text=True))
+
+    r = client.get("/")
+    check(
+        "已登录管理员访问首页直接进后台",
+        r.status_code == 302 and "/admin" in r.headers.get("Location", ""),
+        r.headers.get("Location"),
+    )
+
+    print("\n=== 4B. 旧登录链接收敛到首页 ===")
+    anon = app.test_client()
+    for legacy in ("/login", "/reader/login"):
+        r = anon.get(legacy)
+        check(
+            f"{legacy} 重定向到统一登录页",
+            r.status_code == 302 and r.headers.get("Location", "").startswith("/"),
+            r.headers.get("Location"),
+        )
+    r = anon.get("/login", query_string={"next": "/admin"})
+    check("旧登录链接透传 next", "admin" in r.headers.get("Location", ""), r.headers.get("Location"))
+    r = anon.get("/login", query_string={"next": "https://evil.example.com"})
+    check("拒绝站外 next 参数", "evil" not in r.headers.get("Location", ""), r.headers.get("Location"))
 
     print("\n=== 5. CSRF 防护 ===")
     r = client.post("/api/books", json={"isbn": "9787115428028", "title": "x", "total_copies": 1})
@@ -198,6 +235,53 @@ def main() -> int:
     check("分类过滤生效", api.get("/api/books", query_string={"category": "不存在分类"}).get_json()["total"] == 0)
     check("查询不存在图书返回 404", api.get("/api/books/99999").status_code == 404)
 
+    print("\n=== 6B. 馆藏条码与图书简介 ===")
+    check("新增图书自动分配条码", created["barcode"] == f"BK{book_id:07d}", created.get("barcode"))
+
+    r = api.post(
+        "/api/books",
+        json={
+            "isbn": "9787111111111",
+            "title": "带简介与手工条码的书",
+            "author": "某作者",
+            "total_copies": 2,
+            "barcode": "A-2026-001",
+            "description": "这是用于端到端测试的图书简介，应该在门户与后台都能取到。",
+        },
+    )
+    check("创建带条码与简介的图书 201", r.status_code == 201, r.get_json())
+    tagged = r.get_json()
+    tagged_id = tagged["id"]
+    check("手工条码原样保存", tagged["barcode"] == "A-2026-001", tagged["barcode"])
+    check("简介已保存", tagged["description"].startswith("这是用于端到端测试"), tagged["description"])
+    check("条码自动分配互不重复", tagged["barcode"] != created["barcode"])
+
+    check("重复条码返回 409", api.post("/api/books", json={"isbn": "9787111111112", "title": "撞码", "total_copies": 1, "barcode": "A-2026-001"}).status_code == 409)
+    r = api.post("/api/books", json={"isbn": "9787111111113", "title": "非法条码", "total_copies": 1, "barcode": "带中文的条码"})
+    check("非法条码返回 400", r.status_code == 400, r.status_code)
+    check("非法条码定位到 barcode 字段", r.get_json()["error"]["details"]["field"] == "barcode", r.get_json())
+    r = api.post("/api/books", json={"isbn": "9787111111114", "title": "超长简介", "total_copies": 1, "description": "简" * 1001})
+    check("简介超长返回 400", r.status_code == 400, r.status_code)
+    check("超长简介定位到 description", r.get_json()["error"]["details"]["field"] == "description", r.get_json())
+
+    check("按条码检索命中图书", api.get("/api/books", query_string={"keyword": "A-2026-001"}).get_json()["total"] == 1)
+    check("按自动条码检索命中", api.get("/api/books", query_string={"keyword": created["barcode"]}).get_json()["total"] == 1)
+
+    r = api.put(f"/api/books/{tagged_id}", json={"isbn": "9787111111111", "title": "带简介与手工条码的书", "total_copies": 2, "barcode": "", "description": "简介已更新"})
+    check("条码留空时沿用原值", r.status_code == 200 and r.get_json()["barcode"] == "A-2026-001", r.get_json())
+    check("简介可更新", r.get_json()["description"] == "简介已更新", r.get_json())
+
+    r = client.get("/api/public/search", query_string={"keyword": "A-2026-001"})
+    public_items = r.get_json()["items"]
+    check("门户可按条码检索", len(public_items) == 1, public_items)
+    if public_items:
+        check("门户结果含条码", public_items[0].get("barcode") == "A-2026-001", public_items[0].get("barcode"))
+        check("门户结果含简介", public_items[0].get("description") == "简介已更新", public_items[0].get("description"))
+
+    r = client.get("/api/public/overview")
+    new_arrivals = r.get_json()["new_arrivals"]
+    check("门户新书含条码与简介字段", bool(new_arrivals) and all(k in new_arrivals[0] for k in ("barcode", "description")), list(new_arrivals[0].keys()) if new_arrivals else [])
+
     print("\n=== 7. 读者 CRUD ===")
     member = {"card_no": "2026001", "name": "李思远", "phone": "13800001111", "member_type": "学生", "status": "active"}
     r = api.post("/api/members", json=member)
@@ -217,6 +301,8 @@ def main() -> int:
     check("可续借", loan["can_renew"] is True, loan)
     check("应还日期 = 借出 + 30 天", loan["due_at"][:10] == (timeutil.now() + timedelta(days=30)).strftime("%Y-%m-%d"), loan["due_at"])
     check("库存扣减为 2", api.get(f"/api/books/{book_id}").get_json()["available_copies"] == 2)
+    check("借阅记录带馆藏条码", loan.get("book_barcode") == created["barcode"], loan.get("book_barcode"))
+    check("借阅列表可按条码检索", api.get("/api/loans", query_string={"keyword": created["barcode"]}).get_json()["total"] >= 1)
     check("同一读者重复借同书返回 409", api.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id}).status_code == 409)
 
     r = api.post(f"/api/loans/{loan_id}/renew")
@@ -324,13 +410,239 @@ def main() -> int:
     check("登出后接口不可用", client.get("/api/books").status_code == 401)
 
     print("\n=== 17. 登录限流 ===")
-    auth_service._attempts.clear()
-    codes = [client.post("/api/auth/login", json={"username": "attacker", "password": "x"}).status_code for _ in range(3)]
+    auth_service.login_throttle.reset()
+    codes = [client.post("/api/auth/login", json={"identifier": "attacker", "password": "x"}).status_code for _ in range(3)]
     check("连续失败累计计数", codes == [401, 401, 401], codes)
-    r = client.post("/api/auth/login", json={"username": "attacker", "password": "x"})
+    r = client.post("/api/auth/login", json={"identifier": "attacker", "password": "x"})
     check("超过阈值后锁定返回 422", r.status_code == 422, r.status_code)
     check("锁定提示含剩余时间", "秒后重试" in r.get_json()["error"]["message"], r.get_json())
-    auth_service._attempts.clear()
+    auth_service.login_throttle.reset()
+
+    # ---------------------------------------------------------------- 读者门户账号
+    from library.reader import service as reader_service  # noqa: PLC0415
+
+    print("\n=== 18. 读者账号开通与登录 ===")
+    r = client.post("/api/auth/login", json={"username": ADMIN_USER, "password": "newpass123"})
+    api.csrf = r.get_json()["csrf_token"]
+
+    r = api.post(
+        "/api/members",
+        json={"card_no": "2026002", "name": "王梦琪", "phone": "13800002222", "member_type": "学生", "status": "active"},
+    )
+    check("创建读者返回初始密码（证号后 6 位）", r.status_code == 201 and r.get_json().get("initial_password") == "026002", r.get_json())
+    reader_id = r.get_json()["id"]
+
+    reader = app.test_client()
+    check("未登录访问读者接口 401", reader.get("/api/reader/me").status_code == 401)
+    check("未登录访问读者借阅 401", reader.get("/api/reader/loans").status_code == 401)
+    r = reader.get("/reader")
+    check(
+        "未登录访问个人中心跳统一登录页",
+        r.status_code == 302 and r.headers.get("Location", "").startswith("/?next="),
+        r.headers.get("Location"),
+    )
+
+    r = reader.post("/api/reader/login", json={"account": "2026002", "password": "wrong"})
+    check("读者密码错误 401", r.status_code == 401, r.status_code)
+    check("错误信息不区分账号是否存在", r.get_json()["error"]["message"] == "账号或密码不正确", r.get_json())
+    check("读者空账号 400", reader.post("/api/reader/login", json={"account": "", "password": "x"}).status_code == 400)
+
+    r = reader.post("/api/reader/login", json={"account": "2026002", "password": "026002"})
+    check("借书证号登录成功", r.status_code == 200, r.get_json())
+    reader_csrf = r.get_json()["csrf_token"]
+    check("读者登录返回本人信息", r.get_json()["member"]["card_no"] == "2026002", r.get_json())
+    check("读者登录不下发密码哈希", "password_hash" not in r.get_json()["member"], r.get_json()["member"])
+
+    r = app.test_client().post("/api/reader/login", json={"account": "13800002222", "password": "026002"})
+    check("手机号登录成功", r.status_code == 200, r.get_json())
+
+    r = reader.get("/reader")
+    check("登录后可进入个人中心", r.status_code == 200, r.status_code)
+    check("个人中心页面含我的借阅", "我的借阅" in r.get_data(as_text=True))
+
+    print("\n=== 18B. 统一入口识别读者身份 ===")
+    check("管理员与读者共用同一限流器", reader_service.reader_throttle is auth_service.login_throttle)
+    uni = app.test_client()
+    r = uni.post("/api/auth/login", json={"identifier": "13800002222", "password": "026002"})
+    check("统一入口用手机号登录成功", r.status_code == 200, r.get_json())
+    body = r.get_json()
+    check("自动识别为读者身份", body.get("role") == "reader", body)
+    check("读者落点为个人中心", body.get("redirect") == "/reader", body)
+    check("统一入口返回读者资料", body["member"]["card_no"] == "2026002", body)
+    check("统一入口不下发密码哈希", "password_hash" not in body["member"], body["member"])
+    check("读者会话可访问个人中心接口", uni.get("/api/reader/me").status_code == 200)
+    check("读者会话不能访问后台接口", uni.get("/api/books").status_code == 401)
+    r = uni.get("/")
+    check(
+        "已登录读者访问首页跳个人中心",
+        r.status_code == 302 and "/reader" in r.headers.get("Location", ""),
+        r.headers.get("Location"),
+    )
+    r = uni.get("/admin")
+    check(
+        "读者访问后台被拦回统一登录页",
+        r.status_code == 302 and r.headers.get("Location", "").startswith("/?next="),
+        r.headers.get("Location"),
+    )
+
+    print("\n=== 19. 管理员与读者身份隔离 ===")
+    check("读者不能访问图书管理接口", reader.get("/api/books").status_code == 401)
+    check("读者不能访问读者管理接口", reader.get("/api/members").status_code == 401)
+    check("读者不能访问概览接口", reader.get("/api/dashboard/overview").status_code == 401)
+    r = reader.get("/admin")
+    check(
+        "读者访问后台页面被拦回统一登录页",
+        r.status_code == 302 and r.headers.get("Location", "").startswith("/?next="),
+        r.headers.get("Location"),
+    )
+    check("管理员会话不能访问读者接口", client.get("/api/reader/me").status_code == 401)
+    check("读者写操作缺 CSRF 返回 403", reader.post("/api/reader/logout").status_code == 403)
+    check("读者登录接口本身免登录可访问", app.test_client().post("/api/reader/login", json={}).status_code == 400)
+
+    print("\n=== 20. 我的借阅与自助续借 ===")
+    r = api.post("/api/books", json={"isbn": "9787111123456", "title": "读者端测试书", "author": "测试作者", "category": "测试", "total_copies": 2})
+    book2_id = r.get_json()["id"]
+    loan2 = api.post("/api/loans/borrow", json={"book_id": book2_id, "member_id": reader_id}).get_json()
+
+    me = reader.get("/api/reader/me").get_json()
+    check("读者概览含本人资料", me["member"]["card_no"] == "2026002", me["member"])
+    check("读者概览含在借统计", me["stats"]["active_loans"] == 1, me["stats"])
+    check("读者概览含剩余可借额度", me["stats"]["quota_left"] == 4, me["stats"])
+    check("读者概览含借阅规则", set(me["rules"]) >= {"loan_days", "max_renew", "fine_per_day"}, me["rules"])
+
+    payload = reader.get("/api/reader/loans").get_json()
+    check("只能看到自己的借阅记录", all(i["member_id"] == reader_id for i in payload["items"]) and payload["total"] == 1, payload)
+
+    other_loan = api.get("/api/loans", query_string={"member_id": member_id, "page_size": 1}).get_json()["items"][0]
+    r = reader.post(f"/api/reader/loans/{other_loan['id']}/renew", headers={"X-CSRF-Token": reader_csrf})
+    check("越权续借他人记录 403", r.status_code == 403, r.status_code)
+    check("越权被拒有明确错误码", r.get_json()["error"]["code"] == "forbidden", r.get_json())
+
+    r = reader.post(f"/api/reader/loans/{loan2['id']}/renew", headers={"X-CSRF-Token": reader_csrf})
+    check("自助续借成功", r.status_code == 200 and r.get_json()["renew_count"] == 1, r.get_json())
+    check("续借后应还日期顺延", r.get_json()["due_at"][:10] == (timeutil.now() + timedelta(days=60)).strftime("%Y-%m-%d"), r.get_json()["due_at"])
+    check("不存在的借阅记录 404", reader.post("/api/reader/loans/99999/renew", headers={"X-CSRF-Token": reader_csrf}).status_code == 404)
+    check("读者可按状态筛选", reader.get("/api/reader/loans", query_string={"status": "open"}).get_json()["total"] == 1)
+    check("读者非法状态 400", reader.get("/api/reader/loans", query_string={"status": "bogus"}).status_code == 400)
+
+    print("\n=== 21. 读者资料与密码自助 ===")
+    r = reader.put("/api/reader/profile", json={"phone": "13900001234", "email": "newwang@example.com"}, headers={"X-CSRF-Token": reader_csrf})
+    check("修改联系方式成功", r.status_code == 200 and r.get_json()["phone"] == "13900001234", r.get_json())
+    r = reader.put("/api/reader/profile", json={"phone": "13800001111"}, headers={"X-CSRF-Token": reader_csrf})
+    check("手机号被他人占用 422", r.status_code == 422, r.get_json())
+    check("非法邮箱 400", reader.put("/api/reader/profile", json={"email": "bad-email"}, headers={"X-CSRF-Token": reader_csrf}).status_code == 400)
+    check("改手机号后可用新号登录", app.test_client().post("/api/reader/login", json={"account": "13900001234", "password": "026002"}).status_code == 200)
+
+    r = reader.post("/api/reader/password", json={"old_password": "bad", "new_password": "reader666"}, headers={"X-CSRF-Token": reader_csrf})
+    check("读者旧密码错误 400", r.status_code == 400, r.status_code)
+    r = reader.post("/api/reader/password", json={"old_password": "026002", "new_password": "123"}, headers={"X-CSRF-Token": reader_csrf})
+    check("读者新密码过短 400", r.status_code == 400, r.status_code)
+    r = reader.post("/api/reader/password", json={"old_password": "026002", "new_password": "reader666"}, headers={"X-CSRF-Token": reader_csrf})
+    check("读者修改密码成功", r.status_code == 200, r.get_json())
+    check("改密后读者会话失效", reader.get("/api/reader/me").status_code == 401)
+    check("读者新密码可登录", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "reader666"}).status_code == 200)
+    check("读者旧密码已失效", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "026002"}).status_code == 401)
+
+    print("\n=== 22. 管理员重置密码与读者登录限流 ===")
+    r = api.post(f"/api/members/{reader_id}/reset-password")
+    check("管理员重置读者密码", r.status_code == 200 and r.get_json()["initial_password"] == "026002", r.get_json())
+    check("重置后初始密码可登录", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "026002"}).status_code == 200)
+    check("重置后旧密码失效", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "reader666"}).status_code == 401)
+
+    reader_service.reader_throttle.reset()
+    attacker = app.test_client()
+    codes = [attacker.post("/api/reader/login", json={"account": "2026002", "password": "x"}).status_code for _ in range(3)]
+    check("读者连续失败累计计数", codes == [401, 401, 401], codes)
+    r = attacker.post("/api/reader/login", json={"account": "2026002", "password": "x"})
+    check("读者超阈值锁定 422", r.status_code == 422, r.status_code)
+    check("读者锁定提示含剩余时间", "秒后重试" in r.get_json()["error"]["message"], r.get_json())
+    reader_service.reader_throttle.reset()
+
+    print("\n=== 23. 冻结读者仍可查看借阅 ===")
+    again = app.test_client()
+    r = again.post("/api/reader/login", json={"account": "2026002", "password": "026002"})
+    check("重置密码后可重新登录", r.status_code == 200, r.get_json())
+    csrf2 = r.get_json()["csrf_token"]
+
+    r = again.put(
+        "/api/reader/profile",
+        json={"phone": "13900001234", "email": "newwang@example.com"},
+        headers={"X-CSRF-Token": csrf2},
+    )
+    check("读者可维护联系方式", r.status_code == 200 and r.get_json()["card_no"] == "2026002", r.get_json())
+    r = again.put(
+        "/api/reader/profile",
+        json={"phone": "13900001234", "name": "黑客", "max_borrow": 99, "card_no": "9999999", "status": "active"},
+        headers={"X-CSRF-Token": csrf2},
+    )
+    body = r.get_json()
+    check("读者无法自行提权改姓名", body.get("name") == "王梦琪", body)
+    check("读者无法自行提高可借上限", body.get("max_borrow") == 5, body)
+    check("读者无法自行改证号", body.get("card_no") == "2026002", body)
+
+    api.post(f"/api/loans/{loan2['id']}/return")
+    r = api.put(
+        f"/api/members/{reader_id}",
+        json={"card_no": "2026002", "name": "王梦琪", "phone": "13900001234", "member_type": "学生", "status": "frozen"},
+    )
+    check("还清后可冻结", r.status_code == 200 and r.get_json()["status"] == "frozen", r.get_json())
+    frozen = app.test_client()
+    check("冻结读者仍可登录查看", frozen.post("/api/reader/login", json={"account": "2026002", "password": "026002"}).status_code == 200)
+    me = frozen.get("/api/reader/me").get_json()
+    check("概览如实显示已冻结", me["member"]["status"] == "frozen", me["member"])
+    check("冻结读者历史记录仍可查", frozen.get("/api/reader/loans").get_json()["total"] >= 1)
+    check("读者借阅记录带馆藏条码", all("book_barcode" in item for item in frozen.get("/api/reader/loans").get_json()["items"]))
+
+    print("\n=== 24. 老库升级：条码与简介自动补齐 ===")
+    import sqlite3  # noqa: PLC0415 - 仅本段使用
+
+    from library import barcode as barcode_util  # noqa: PLC0415
+    from library import seed as seed_module  # noqa: PLC0415
+
+    legacy_path = os.path.join(tmp_dir, "legacy.db")
+    raw = sqlite3.connect(legacy_path)
+    raw.executescript(
+        """
+        CREATE TABLE books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            isbn TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT '',
+            publisher TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '未分类',
+            publish_year INTEGER,
+            location TEXT NOT NULL DEFAULT '',
+            total_copies INTEGER NOT NULL DEFAULT 1,
+            available_copies INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+        INSERT INTO books (isbn, title, author, category) VALUES ('9787506365437', '活着', '余华', '文学');
+        INSERT INTO books (isbn, title, author, category) VALUES ('9787111111111', '库内自有书目', '某作者', '计算机');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    legacy_app = build_app(legacy_path)  # create_app 内含 init_db：自动迁移
+    with legacy_app.app_context():
+        legacy_rows = db.query_all("SELECT id, isbn, barcode, description FROM books ORDER BY id")
+        check("迁移后新列可用", all("barcode" in row and "description" in row for row in legacy_rows), legacy_rows)
+        check("存量图书补上条码", all(row["barcode"] == barcode_util.generate(row["id"]) for row in legacy_rows), legacy_rows)
+        check(
+            "条码唯一索引已创建",
+            bool(db.query_all("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_books_barcode'")),
+        )
+        after = {row["isbn"]: row for row in db.query_all("SELECT isbn, barcode, description FROM books")}
+        check("启动即自动回填演示简介", len(after["9787506365437"]["description"]) > 20, after["9787506365437"])
+        check("非演示书保持空简介", after["9787111111111"]["description"] == "", after["9787111111111"])
+        check("回填幂等（已有简介不重复写）", seed_module.ensure_content() == 0)
+        db.init_db()  # 再次初始化不应改变既有条码
+        check(
+            "重复初始化条码保持稳定",
+            [row["barcode"] for row in db.query_all("SELECT barcode FROM books ORDER BY id")]
+            == [row["barcode"] for row in legacy_rows],
+        )
 
     print(f"\n{'=' * 46}\n结果：{PASSED} 项通过，{FAILED} 项失败\n{'=' * 46}")
     return 0 if FAILED == 0 else 1

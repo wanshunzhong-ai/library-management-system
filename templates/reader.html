@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>我的借阅 · {{ library_name }}</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <link rel="stylesheet" href="/static/css/site.css" />
+  <link rel="stylesheet" href="/static/css/reader.css" />
+</head>
+<body class="reader-body">
+  <header class="reader-head">
+    <div class="wrap reader-head-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark">图</span>
+        <span class="brand-text">
+          <strong>{{ library_name }}</strong>
+          <small>READER CENTER</small>
+        </span>
+      </a>
+      <nav class="reader-nav">
+        <a href="/">门户首页</a>
+        <a href="/#search">馆藏检索</a>
+      </nav>
+      <div class="reader-me">
+        <span class="me-name" id="headName">—</span>
+        <span class="me-card" id="headCard">—</span>
+        <button class="btn btn-outline btn-mini" id="logoutBtn" type="button">退出登录</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap reader-main">
+    <section class="card reader-hero">
+      <div>
+        <h1>你好，<span id="welcomeName">读者</span></h1>
+        <p class="hero-sub" id="welcomeMeta">正在加载你的借阅信息…</p>
+        <div class="hero-chips" id="heroChips"></div>
+      </div>
+      <div class="hero-quota">
+        <span class="q-num" id="quotaLeft">—</span>
+        <span class="q-label">剩余可借册数</span>
+      </div>
+    </section>
+
+    <section class="stat-grid" id="statGrid"></section>
+
+    <section class="card reader-panel">
+      <div class="panel-head">
+        <h2>我的借阅</h2>
+        <span class="sub" id="loanSummary"></span>
+        <div class="tabs" id="loanTabs">
+          <button class="tab is-active" data-status="all" type="button">全部</button>
+          <button class="tab" data-status="open" type="button">未归还</button>
+          <button class="tab" data-status="overdue" type="button">逾期</button>
+          <button class="tab" data-status="returned" type="button">已归还</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>图书</th>
+              <th>借出日期</th>
+              <th>应还 / 归还日期</th>
+              <th>状态</th>
+              <th>滞纳金</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="loanBody"></tbody>
+        </table>
+      </div>
+      <div class="pager" id="loanPager"></div>
+    </section>
+
+    <section class="reader-cols">
+      <div class="card reader-panel">
+        <div class="panel-head">
+          <h2>个人资料</h2>
+          <span class="sub">姓名、证号与可借上限由馆员维护</span>
+        </div>
+        <form class="form-grid" id="profileForm" novalidate>
+          <div class="field"><label for="pCardNo">借书证号</label><input id="pCardNo" disabled /></div>
+          <div class="field"><label for="pName">姓名</label><input id="pName" disabled /></div>
+          <div class="field"><label for="pType">读者类型</label><input id="pType" disabled /></div>
+          <div class="field"><label for="pStatus">账号状态</label><input id="pStatus" disabled /></div>
+          <div class="field" id="fieldPhone">
+            <label for="pPhone">手机号</label>
+            <input id="pPhone" name="phone" type="text" placeholder="可用于登录与到馆提醒" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field" id="fieldEmail">
+            <label for="pEmail">邮箱</label>
+            <input id="pEmail" name="email" type="text" placeholder="选填" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full">
+            <button class="btn btn-primary" type="submit" id="profileBtn">保存联系方式</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card reader-panel">
+        <div class="panel-head">
+          <h2>修改密码</h2>
+          <span class="sub">修改后需重新登录</span>
+        </div>
+        <form class="form-grid" id="pwForm" novalidate>
+          <div class="field full" id="fieldOld">
+            <label for="oldPassword">当前密码<span class="req">*</span></label>
+            <input id="oldPassword" type="password" autocomplete="current-password" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full" id="fieldNew">
+            <label for="newPassword">新密码<span class="req">*</span></label>
+            <input id="newPassword" type="password" autocomplete="new-password" placeholder="至少 6 位" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full" id="fieldNew2">
+            <label for="newPassword2">确认新密码<span class="req">*</span></label>
+            <input id="newPassword2" type="password" autocomplete="new-password" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full">
+            <button class="btn btn-primary" type="submit" id="pwBtn">修改密码</button>
+          </div>
+        </form>
+        <div class="panel-note" id="rulesNote">借阅规则加载中…</div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-layer" id="toastLayer"></div>
+  <script src="/static/js/reader.js"></script>
+</body>
+</html>

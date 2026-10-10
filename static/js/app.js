@@ -38,6 +38,14 @@
 
   const money = (value) => "¥" + Number(value || 0).toFixed(2);
 
+  const LIBRARY_NAME = document.body.dataset.library || "图书馆";
+
+  /** 条码号：等宽小标签，便于对标签核对 */
+  const barcodeChip = (code) =>
+    code
+      ? `<span class="barcode-no">${esc(code)}</span>`
+      : '<span class="barcode-no is-empty">未设置</span>';
+
   /* ---------------- Toast ---------------- */
 
   const toast = (title, body, kind) => {
@@ -72,7 +80,7 @@
     auth.redirecting = true;
     toast("登录状态已失效", "即将返回登录页…", "error");
     const next = encodeURIComponent(location.pathname + location.hash);
-    setTimeout(() => location.replace("/login?next=" + next), 900);
+    setTimeout(() => location.replace("/?next=" + next), 900);
   }
 
   const api = {
@@ -321,7 +329,7 @@
     } else {
       table.innerHTML = `
         <thead><tr>
-          <th>书名 / 作者</th><th>ISBN</th><th>分类</th><th>出版社</th><th>年份</th><th>位置</th><th>库存</th><th>操作</th>
+          <th>书名 / 作者 / 简介</th><th>条码 / ISBN</th><th>分类</th><th>出版社</th><th>年份</th><th>位置</th><th>库存</th><th>操作</th>
         </tr></thead>
         <tbody>${payload.items
           .map((b) => {
@@ -329,14 +337,19 @@
             const total = Number(b.total_copies) || 0;
             const tone = avail === 0 ? "danger" : avail <= 1 ? "warn" : "ok";
             return `<tr>
-              <td class="wrap title-cell"><strong>${esc(b.title)}</strong><div class="sub">${esc(b.author || "佚名")}</div></td>
-              <td class="sub">${esc(b.isbn)}</td>
+              <td class="wrap title-cell">
+                <strong>${esc(b.title)}</strong>
+                <div class="sub">${esc(b.author || "佚名")}</div>
+                <div class="book-desc">${b.description ? esc(b.description) : "暂无简介"}</div>
+              </td>
+              <td class="barcode-cell">${barcodeChip(b.barcode)}<div class="sub">${esc(b.isbn)}</div></td>
               <td><span class="badge neutral">${esc(b.category)}</span></td>
               <td>${esc(b.publisher || "—")}</td>
               <td class="num sub">${b.publish_year ? esc(b.publish_year) : "—"}</td>
               <td class="sub">${esc(b.location || "—")}</td>
               <td><span class="badge ${tone}">${avail} / ${total}</span></td>
               <td><div class="actions">
+                <button class="btn sm" data-detail="${b.id}">详情</button>
                 <button class="btn sm" data-edit="${b.id}">编辑</button>
                 <button class="btn sm" data-borrow="${b.id}" ${avail === 0 ? "disabled" : ""}>借出</button>
                 <button class="btn sm danger" data-del="${b.id}">删除</button>
@@ -352,6 +365,9 @@
       loadBooks().catch(showError);
     });
 
+    table.querySelectorAll("[data-detail]").forEach((btn) =>
+      btn.addEventListener("click", () => openBookDetail(Number(btn.dataset.detail)))
+    );
     table.querySelectorAll("[data-edit]").forEach((btn) =>
       btn.addEventListener("click", () => openBookForm(Number(btn.dataset.edit)))
     );
@@ -387,6 +403,7 @@
             <div class="form-grid">
               <div class="field full"><label>书名<span class="req">*</span></label><input name="title" value="${esc(b.title || "")}" placeholder="如：Python 编程：从入门到实践" /></div>
               <div class="field"><label>ISBN<span class="req">*</span></label><input name="isbn" value="${esc(b.isbn || "")}" placeholder="10 位或 13 位" /><span class="tip">可含连字符，保存时自动规整</span></div>
+              <div class="field"><label>馆藏条码</label><input name="barcode" value="${esc(b.barcode || "")}" placeholder="留空则自动生成 BK 编号" /><span class="tip">4–32 位字母、数字或连字符；留空自动分配，也可填馆内已有条码</span></div>
               <div class="field"><label>作者</label><input name="author" value="${esc(b.author || "")}" /></div>
               <div class="field"><label>出版社</label><input name="publisher" value="${esc(b.publisher || "")}" /></div>
               <div class="field"><label>分类</label><input name="category" value="${esc(b.category || "")}" placeholder="未分类" /></div>
@@ -395,17 +412,99 @@
               <div class="field"><label>总册数<span class="req">*</span></label><input name="total_copies" value="${b.total_copies !== undefined ? esc(b.total_copies) : 1}" />
                 <span class="tip">${isEdit ? `在借 ${b.active_loans || 0} 册，总册数不可小于该值` : "可借数将自动等于总册数"}</span>
               </div>
+              <div class="field full"><label>图书简介</label>
+                <textarea name="description" rows="4" maxlength="1000" placeholder="内容提要、适读人群、推荐理由等，将展示在读者门户">${esc(b.description || "")}</textarea>
+                <span class="tip">最多 1000 字；门户书卡与检索详情会展示这段内容</span>
+              </div>
             </div>`,
           confirmText: isEdit ? "保存修改" : "创建图书",
           onSubmit: async (form) => {
             const data = readForm(form);
             const result = isEdit ? await api.put(`/api/books/${id}`, data) : await api.post("/api/books", data);
-            toast(isEdit ? "图书已更新" : "图书已创建", `《${result.title}》`, "ok");
+            toast(
+              isEdit ? "图书已更新" : "图书已创建",
+              `《${result.title}》· 条码 ${result.barcode}`,
+              "ok"
+            );
             await Promise.all([loadBooks(), loadCategories(), state.view === "dashboard" ? loadDashboard() : null]);
           },
         });
       })
       .catch(showError);
+  }
+
+  /* ---------------- 图书详情与条码标签 ---------------- */
+
+  function openBookDetail(id) {
+    api
+      .get(`/api/books/${id}`)
+      .then((b) => {
+        const avail = Number(b.available_copies) || 0;
+        const total = Number(b.total_copies) || 0;
+        const tone = avail === 0 ? "danger" : avail <= 1 ? "warn" : "ok";
+        const body = `
+          <div class="book-detail">
+            <div class="bd-head">
+              <div class="bd-title">《${esc(b.title)}》</div>
+              <div class="bd-sub">${esc(b.author || "佚名")} · ${esc(b.publisher || "未标注出版社")}${b.publish_year ? ` · ${esc(b.publish_year)} 年` : ""}</div>
+              <div class="bd-tags">
+                <span class="badge neutral">${esc(b.category)}</span>
+                <span class="badge ${tone}">可借 ${avail} / ${total} 册</span>
+                <span class="badge neutral">馆藏位置 ${esc(b.location || "待分配")}</span>
+                ${Number(b.active_loans) > 0 ? `<span class="badge info">在借 ${Number(b.active_loans)} 册</span>` : ""}
+              </div>
+            </div>
+            <div class="bd-barcode">
+              ${b.barcode ? Barcode.svg(b.barcode, { height: 56 }) : '<div class="empty">尚未设置条码</div>'}
+            </div>
+          </div>
+          <div class="bd-section">
+            <h4>图书简介</h4>
+            <p class="bd-desc">${b.description ? esc(b.description) : "暂无简介，可点击下方「编辑这本图书」补充。"}</p>
+          </div>
+          <div class="bd-meta">
+            <div><span>馆藏条码</span><b class="mono">${esc(b.barcode || "—")}</b></div>
+            <div><span>ISBN</span><b class="mono">${esc(b.isbn)}</b></div>
+            <div><span>入库时间</span><b>${esc(fmtDate(b.created_at))}</b></div>
+            <div><span>最近更新</span><b>${esc(fmtDate(b.updated_at))}</b></div>
+          </div>
+          <div class="bd-actions">
+            <button type="button" class="btn sm" data-print>打印条码标签</button>
+            <button type="button" class="btn sm" data-edit>编辑这本图书</button>
+          </div>`;
+        openModal({
+          title: `图书详情 #${b.id}`,
+          body,
+          confirmText: "关闭",
+          hideCancel: true,
+          onSubmit: async () => {},
+          onMount: (form) => {
+            const printBtn = form.querySelector("[data-print]");
+            if (printBtn) printBtn.addEventListener("click", () => printBarcodeLabel(b));
+            form.querySelector("[data-edit]").addEventListener("click", () => {
+              closeModal();
+              openBookForm(b.id);
+            });
+          },
+        });
+      })
+      .catch(showError);
+  }
+
+  function printBarcodeLabel(book) {
+    if (!book.barcode) {
+      toast("无法打印", "该书还没有条码号，请先编辑补充", "error");
+      return;
+    }
+    $("#printLayer").innerHTML = `
+      <div class="print-label">
+        <div class="pl-lib">${esc(LIBRARY_NAME)}</div>
+        <div class="pl-title">《${esc(book.title)}》</div>
+        <div class="pl-sub">${esc(book.author || "佚名")} · 索书号 ${esc(book.location || "待分配")}</div>
+        <div class="pl-code">${Barcode.svg(book.barcode, { height: 44, fontSize: 11 })}</div>
+        <div class="pl-isbn">ISBN ${esc(book.isbn)}</div>
+      </div>`;
+    window.print();
   }
 
   function confirmDeleteBook(id) {
@@ -438,7 +537,7 @@
     } else {
       table.innerHTML = `
         <thead><tr>
-          <th>姓名 / 证号</th><th>类型</th><th>联系方式</th><th>可借上限</th><th>在借</th><th>逾期</th><th>状态</th><th>操作</th>
+          <th>姓名 / 证号</th><th>类型</th><th>联系方式</th><th>可借上限</th><th>在借</th><th>逾期</th><th>状态</th><th>门户账号</th><th>操作</th>
         </tr></thead>
         <tbody>${payload.items
           .map((m) => {
@@ -453,9 +552,11 @@
               <td class="num">${active}</td>
               <td>${overdue > 0 ? `<span class="badge danger">${overdue}</span>` : `<span class="sub">0</span>`}</td>
               <td><span class="badge ${frozen ? "warn" : "ok"}">${frozen ? "已冻结" : "正常"}</span></td>
+              <td>${Number(m.has_account) ? '<span class="badge neutral">已开通</span>' : '<span class="sub">未开通</span>'}</td>
               <td><div class="actions">
                 <button class="btn sm" data-edit="${m.id}">编辑</button>
                 <button class="btn sm" data-history="${m.id}">借阅记录</button>
+                <button class="btn sm" data-resetpw="${m.id}">重置密码</button>
                 <button class="btn sm danger" data-del="${m.id}">删除</button>
               </div></td>
             </tr>`;
@@ -478,6 +579,22 @@
     table.querySelectorAll("[data-history]").forEach((btn) =>
       btn.addEventListener("click", () => openMemberHistory(Number(btn.dataset.history)))
     );
+    table.querySelectorAll("[data-resetpw]").forEach((btn) =>
+      btn.addEventListener("click", () => confirmResetPassword(Number(btn.dataset.resetpw)))
+    );
+  }
+
+  function confirmResetPassword(id) {
+    openModal({
+      title: "重置读者门户密码",
+      body: `<div class="form-note">将把该读者的登录密码重置为 <b>证号后 6 位</b>。重置后请转告读者，并提醒其登录后自行修改密码。</div>`,
+      confirmText: "确认重置",
+      onSubmit: async () => {
+        const result = await api.post(`/api/members/${id}/reset-password`, {});
+        toast("密码已重置", `${result.card_no} 的新密码：${result.initial_password}`, "ok");
+        await loadMembers();
+      },
+    });
   }
 
   function openMemberForm(id) {
@@ -515,7 +632,15 @@
             const data = readForm(form);
             if (data.max_borrow === "") delete data.max_borrow;
             const result = isEdit ? await api.put(`/api/members/${id}`, data) : await api.post("/api/members", data);
-            toast(isEdit ? "读者已更新" : "读者已创建", `${result.name}（${result.card_no}）`, "ok");
+            if (!isEdit && result.initial_password) {
+              toast(
+                "读者已创建，门户账号已开通",
+                `${result.card_no} 的初始密码为 ${result.initial_password}（证号后 6 位），请转告读者`,
+                "ok"
+              );
+            } else {
+              toast(isEdit ? "读者已更新" : "读者已创建", `${result.name}（${result.card_no}）`, "ok");
+            }
             await loadMembers();
           },
         });
@@ -555,7 +680,7 @@
                 <tbody>${rows
                   .map(
                     (r) => `<tr>
-                      <td class="wrap title-cell">${esc(r.book_title)}</td>
+                      <td class="wrap title-cell">${esc(r.book_title)}<div class="sub">${esc(r.book_barcode || "—")}</div></td>
                       <td class="sub">${esc(fmtDate(r.borrowed_at))}</td>
                       <td class="sub">${esc(fmtDate(r.due_at))}</td>
                       <td class="sub">${esc(fmtDate(r.returned_at))}</td>
@@ -599,7 +724,7 @@
           .map((r) => {
             const open = r.status !== "returned";
             return `<tr>
-              <td class="wrap title-cell"><strong>${esc(r.book_title)}</strong><div class="sub">${esc(r.book_isbn)}</div></td>
+              <td class="wrap title-cell"><strong>${esc(r.book_title)}</strong><div class="sub">${esc(r.book_barcode || "—")} · ISBN ${esc(r.book_isbn)}</div></td>
               <td>${esc(r.member_name)}<div class="sub">${esc(r.member_card)}</div></td>
               <td class="sub">${esc(fmtDate(r.borrowed_at))}</td>
               <td class="${r.status === "overdue" ? "" : "sub"}">${esc(fmtDate(r.due_at))}</td>
@@ -639,7 +764,7 @@
       onSubmit: async () => {
         const result = await api.post(`/api/loans/${id}/return`, {});
         const extra = Number(result.fine) > 0 ? `逾期 ${result.overdue_days} 天，罚金 ${money(result.fine)}` : "按期归还，无罚金";
-        toast("还书成功", `《${result.book_title}》· ${extra}`, Number(result.fine) > 0 ? "warn" : "ok");
+        toast("还书成功", `《${result.book_title}》· 条码 ${result.book_barcode || "—"} · ${extra}`, Number(result.fine) > 0 ? "warn" : "ok");
         await refreshAfterLoanChange();
       },
     });
@@ -672,7 +797,7 @@
       title: "办理借书",
       body: `
         <div class="form-grid">
-          <div class="field full"><label>检索图书</label><input name="book_filter" placeholder="输入书名 / 作者 / ISBN 过滤" /></div>
+          <div class="field full"><label>检索图书</label><input name="book_filter" placeholder="输入书名 / 作者 / ISBN / 条码过滤" /></div>
           <div class="field full"><label>选择图书<span class="req">*</span></label><select name="book_id" id="borrowBook"></select></div>
           <div class="field full"><label>检索读者</label><input name="member_filter" placeholder="输入姓名 / 证号过滤" /></div>
           <div class="field full"><label>选择读者<span class="req">*</span></label><select name="member_id" id="borrowMember"></select></div>
@@ -697,7 +822,7 @@
                 .map(
                   (b) =>
                     `<option value="${b.id}" ${prefillBookId === b.id ? "selected" : ""}>` +
-                    `${esc(b.title)}（${esc(b.author || "佚名")}）· 可借 ${b.available_copies}/${b.total_copies}</option>`
+                    `${esc(b.title)}（${esc(b.author || "佚名")}）· ${esc(b.barcode || "无条码")} · 可借 ${b.available_copies}/${b.total_copies}</option>`
                 )
                 .join("")
             : `<option value="">没有可借图书</option>`;
@@ -736,7 +861,7 @@
           member_id: Number(memberId),
           note: form.note.value,
         });
-        toast("借书成功", `《${result.book_title}》→ ${result.member_name}，应还 ${fmtDate(result.due_at)}`, "ok");
+        toast("借书成功", `《${result.book_title}》· ${result.book_barcode || ""} → ${result.member_name}，应还 ${fmtDate(result.due_at)}`, "ok");
         await refreshAfterLoanChange();
       },
     });
@@ -849,7 +974,7 @@
     } catch (err) {
       /* 忽略：无论服务端结果如何都回到登录页 */
     }
-    location.replace("/login");
+    location.replace("/");
   }
 
   function openChangePassword() {
@@ -873,7 +998,7 @@
         }
         await api.post("/api/auth/password", { old_password: oldPassword, new_password: newPassword });
         toast("密码已修改", "请使用新密码重新登录", "ok");
-        setTimeout(() => location.replace("/login"), 1200);
+        setTimeout(() => location.replace("/"), 1200);
       },
     });
   }

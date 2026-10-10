@@ -1,38 +1,5 @@
-/* ============ 管理员登录 ============ */
-.login-body { background: #eef1f7; }
-
-.login-shell { display: grid; grid-template-columns: 420px 1fr; min-height: 100vh; }
-
-/* 左侧品牌区 */
-.login-aside {
-  background: linear-gradient(160deg, #1d3a72 0%, #24509e 46%, #2f6feb 100%);
-  color: #fff; padding: 34px 34px 26px; display: flex; flex-direction: column; position: relative; overflow: hidden;
-}
-.login-aside::after {
-  content: ""; position: absolute; right: -120px; bottom: -140px;
-  width: 380px; height: 380px; border-radius: 50%;
-  background: radial-gradient(circle, rgba(255,255,255,.16), transparent 68%);
-}
-.aside-body { margin: auto 0; position: relative; z-index: 1; }
-.aside-body h2 { font-size: 25px; margin-bottom: 12px; color: #fff; }
-.aside-body p { color: rgba(255,255,255,.78); font-size: 13.5px; margin-bottom: 24px; max-width: 300px; }
-.aside-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 12px; }
-.aside-list li { display: flex; align-items: center; gap: 10px; color: rgba(255,255,255,.9); font-size: 13.5px; }
-.aside-list li span {
-  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 8px;
-  background: rgba(255,255,255,.14); display: grid; place-items: center; font-size: 12px;
-}
-.aside-note { position: relative; z-index: 1; color: rgba(255,255,255,.55); font-size: 11.5px; }
-
-/* 右侧表单区 */
-.login-main { display: grid; place-items: center; padding: 32px; }
-.login-card {
-  width: 100%; max-width: 372px; background: var(--surface);
-  border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg);
-  padding: 34px 32px 26px;
-}
-.login-card h1 { font-size: 23px; margin-bottom: 5px; }
-.login-sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+/* ============ 登录表单控件 ============
+   全站只有一个登录入口（首页），这里只保留表单控件样式供统一登录卡复用。 */
 
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
 .field label { font-size: 12.5px; color: var(--text-soft); font-weight: 500; }
@@ -66,14 +33,4 @@
 .login-hint code {
   background: #fff; border: 1px solid var(--border); border-radius: 4px;
   padding: 1px 5px; font-size: 11.5px; color: var(--primary);
-}
-
-.back-link { display: inline-block; margin-top: 18px; color: var(--muted); font-size: 12.5px; }
-.back-link:hover { color: var(--primary); }
-
-@media (max-width: 860px) {
-  .login-shell { grid-template-columns: 1fr; }
-  .login-aside { padding: 24px; }
-  .aside-body { margin: 24px 0; }
-  .aside-note { display: none; }
 }

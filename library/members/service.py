@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping
 
 from config import get_config
 from library import db
-from library.errors import ConflictError, NotFoundError
+from library.auth.passwords import hash_password, initial_password
+from library.errors import BusinessRuleError, ConflictError, NotFoundError
 from library.members import repository as repo
 from library.validation import (
     optional_email,
@@ -16,6 +18,8 @@ from library.validation import (
     require_choice,
     require_str,
 )
+
+logger = logging.getLogger(__name__)
 
 MEMBER_TYPES = {"学生", "教师", "社会", "VIP"}
 MEMBER_STATUS = {"active", "frozen"}
@@ -62,8 +66,47 @@ def create_member(payload: Mapping[str, Any]) -> dict[str, Any]:
     data = _normalize(payload, default_max_borrow=get_config().default_max_borrow)
     if repo.exists_card(data["card_no"]):
         raise ConflictError(f"读者证号 {data['card_no']} 已存在", details={"field": "card_no"})
+
+    # 新建读者即开通门户账号，初始密码为证号后 6 位
+    plain_password = initial_password(data["card_no"])
+    data["password_hash"] = hash_password(plain_password) if plain_password else ""
     member_id = repo.insert(data)
-    return get_member(member_id)
+
+    member = get_member(member_id)
+    # 明文初始密码只在创建响应里返回一次，供管理员转告读者
+    member["initial_password"] = plain_password
+    return member
+
+
+def reset_member_password(member_id: int) -> dict[str, Any]:
+    """管理员把读者密码重置为初始密码（证号后 6 位）。"""
+    member = repo.get(member_id)
+    if member is None:
+        raise NotFoundError(f"读者 #{member_id} 不存在")
+    plain = initial_password(str(member["card_no"]))
+    if not plain:
+        raise BusinessRuleError("该读者证号为空，无法生成初始密码")
+    repo.update_password_hash(member_id, hash_password(plain))
+    logger.info("重置读者密码", extra={"extra_fields": {"member_id": member_id, "card_no": member["card_no"]}})
+    return {"member_id": member_id, "card_no": member["card_no"], "initial_password": plain}
+
+
+def ensure_reader_accounts() -> int:
+    """启动时为历史读者回填初始密码（老库升级后没有账号的读者）。"""
+    pending = repo.readers_without_password()
+    filled = 0
+    for row in pending:
+        plain = initial_password(str(row["card_no"]))
+        if not plain:
+            continue
+        repo.update_password_hash(int(row["id"]), hash_password(plain))
+        filled += 1
+    if filled:
+        logger.warning(
+            "已为历史读者开通门户账号（初始密码 = 证号后 6 位），请提醒读者尽快修改",
+            extra={"extra_fields": {"count": filled}},
+        )
+    return filled
 
 
 def update_member(member_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:

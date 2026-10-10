@@ -33,3 +33,9 @@ def update_member(member_id: int):
 def delete_member(member_id: int):
     service.delete_member(member_id)
     return jsonify({"deleted": member_id})
+
+
+@bp.post("/<int:member_id>/reset-password")
+def reset_password(member_id: int):
+    """把读者门户密码重置为初始密码（证号后 6 位）。"""
+    return jsonify(service.reset_member_password(member_id))

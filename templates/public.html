@@ -3,9 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{{ library_name }} · 馆藏检索</title>
-  <meta name="description" content="{{ library_name }}读者门户：馆藏检索、新书推荐与借阅规则查询。" />
+  <title>{{ library_name }} · 登录与馆藏检索</title>
+  <meta name="description" content="{{ library_name }}：读者与馆员统一登录入口，附馆藏检索、新书推荐与借阅规则查询。" />
   <link rel="stylesheet" href="/static/css/site.css" />
+  <link rel="stylesheet" href="/static/css/login.css" />
   <link rel="stylesheet" href="/static/css/public.css" />
 </head>
 <body>
@@ -24,31 +25,75 @@
         <a href="#rules">借阅规则</a>
         <a href="#about">关于本馆</a>
       </nav>
-      <a class="btn btn-ghost admin-entry" href="/login">
-        <span class="lock">🔒</span> 管理员登录
+      <a class="btn btn-primary header-login" href="#login">
+        <span class="lock">🔐</span> 登录
       </a>
     </div>
   </header>
 
   <section class="hero">
-    <div class="wrap">
-      <p class="hero-eyebrow">{{ library_slogan }}</p>
-      <h1 class="hero-title">找一本书，从这里开始</h1>
-      <p class="hero-sub">
-        输入书名、作者或 ISBN，即可查询这本书是否在馆、还剩几册可借、在哪个书架。
-      </p>
+    <div class="wrap hero-grid">
+      <div class="hero-main">
+        <p class="hero-eyebrow">{{ library_slogan }}</p>
+        <h1 class="hero-title">找一本书，从这里开始</h1>
+        <p class="hero-sub">
+          输入书名、作者、ISBN 或馆藏条码，即可查询这本书是否在馆、还剩几册可借、在哪个书架；
+          通过登录框登录后，读者进入「我的借阅」，馆员进入后台控制台。
+        </p>
 
-      <form class="searchbar" id="searchForm" autocomplete="off">
-        <span class="searchbar-ico" aria-hidden="true">⌕</span>
-        <input id="q" type="search" placeholder="例如：活着 / 余华 / 9787506365437" aria-label="检索馆藏" />
-        <select id="categoryFilter" aria-label="分类筛选">
-          <option value="">全部分类</option>
-        </select>
-        <label class="switch"><input type="checkbox" id="availableOnly" /> 仅看可借</label>
-        <button class="btn btn-primary" type="submit">检索</button>
-      </form>
+        <form class="searchbar" id="searchForm" autocomplete="off">
+          <span class="searchbar-ico" aria-hidden="true">⌕</span>
+          <input id="q" type="search" placeholder="例如：活着 / 余华 / 9787506365437 / BK0000006" aria-label="检索馆藏" />
+          <select id="categoryFilter" aria-label="分类筛选">
+            <option value="">全部分类</option>
+          </select>
+          <label class="switch"><input type="checkbox" id="availableOnly" /> 仅看可借</label>
+          <button class="btn btn-primary" type="submit">检索</button>
+        </form>
 
-      <div class="chips" id="quickChips"></div>
+        <div class="chips" id="quickChips"></div>
+
+        <ul class="hero-points">
+          <li><b>免登录检索</b>馆藏与在架状态随时可查</li>
+          <li><b>读者登录</b>凭借书证号查看在借、自助续借</li>
+          <li><b>馆员登录</b>凭工作账号进入后台办理借还</li>
+        </ul>
+      </div>
+
+      <aside class="hero-login">
+        <div class="login-panel" id="login">
+          <div class="lp-head">
+            <h2>登录</h2>
+            <p>读者用借书证号 / 手机号，馆员用工作账号</p>
+          </div>
+
+          <form id="portalLoginForm" novalidate>
+            <div class="field" id="plFieldAccount">
+              <label for="portalIdentifier">账号</label>
+              <input id="portalIdentifier" name="identifier" type="text" autocomplete="username"
+                     placeholder="借书证号 / 手机号 / 工作账号" />
+            </div>
+
+            <div class="field" id="plFieldPassword">
+              <label for="portalPassword">密码</label>
+              <div class="pw-wrap">
+                <input id="portalPassword" name="password" type="password" autocomplete="current-password"
+                       placeholder="请输入密码" />
+                <button type="button" class="pw-toggle" id="portalPwToggle" aria-label="显示密码">显示</button>
+              </div>
+            </div>
+
+            <div class="login-error" id="portalLoginError" hidden></div>
+
+            <button class="btn btn-primary btn-block" type="submit" id="portalLoginBtn">登录</button>
+          </form>
+
+          <div class="login-hint">
+            <b>读者</b>初始密码为借书证号后 6 位（证号 <code>2024001</code> → 密码 <code>024001</code>）；
+            <b>馆员</b>使用后台工作账号。登录后系统自动识别身份并进入对应工作台。
+          </div>
+        </div>
+      </aside>
     </div>
   </section>
 
@@ -75,7 +120,7 @@
   <section class="wrap section" id="recommend">
     <div class="section-head">
       <h2>馆藏推荐</h2>
-      <span class="section-note">按借阅热度挑选，当前均有可借库存</span>
+      <span class="section-note">按借阅热度挑选，点击卡片可查看内容简介与馆藏条码</span>
     </div>
     <div class="cards" id="recommendCards"></div>
   </section>
@@ -105,8 +150,10 @@
           提供开架借阅、馆内阅览与信息咨询服务。
         </p>
         <p>
-          本页面为读者自助查询入口：无需登录即可检索馆藏、查看在架情况与馆藏位置。
-          图书的借还办理、读者档案维护与流通统计由馆员在后台系统中完成，后台仅对工作人员开放。
+          本页面既是全站登录入口，也是读者自助查询入口：无需登录即可检索馆藏、查看在架情况与馆藏位置。
+          <b>读者凭本人借书证号登录</b>后可查看在借图书、应还日期与滞纳金，并自助续借；
+          图书的借还办理、读者档案维护与流通统计由馆员在工作账号登录后的后台完成。
+          无论读者还是馆员，都必须登录才能进入各自的工作台。
         </p>
         <ul class="about-list">
           <li><b>开馆时间</b>周一至周日 09:00 – 21:00（法定节假日以公告为准）</li>
@@ -122,7 +169,9 @@
           <li>请按期归还，逾期将按日计算滞纳金。</li>
           <li>图书污损或遗失，需按规定赔偿。</li>
         </ol>
-        <a class="btn btn-outline" href="/login">工作人员入口</a>
+        <div class="about-actions">
+          <a class="btn btn-primary" href="#login">前往登录</a>
+        </div>
       </div>
     </div>
   </section>
@@ -133,11 +182,23 @@
       <span class="dot">·</span>
       <span>馆藏检索系统</span>
       <span class="footer-spacer"></span>
-      <a href="/login">管理员登录</a>
+      <a href="#login">登录入口</a>
     </div>
   </footer>
 
   <div class="toast-layer" id="toastLayer"></div>
+
+  <div class="bk-modal-layer" id="bookModal" hidden>
+    <div class="bk-modal" role="dialog" aria-modal="true" aria-labelledby="bookModalTitle">
+      <div class="bk-modal-head">
+        <h3 id="bookModalTitle">图书详情</h3>
+        <button class="bk-modal-close" id="bookModalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="bk-modal-body" id="bookModalBody"></div>
+    </div>
+  </div>
+
+  <script src="/static/js/barcode.js"></script>
   <script src="/static/js/public.js"></script>
 </body>
 </html>

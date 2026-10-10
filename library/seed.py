@@ -6,36 +6,11 @@ import logging
 import random
 from datetime import timedelta
 
-from library import db, timeutil
+from library import barcode, db, timeutil
+from library.auth.passwords import hash_password, initial_password
+from library.demo_catalog import BOOKS, DESCRIPTIONS_BY_ISBN
 
 logger = logging.getLogger(__name__)
-
-BOOKS = [
-    ("9787115428028", "Python 编程：从入门到实践", "Eric Matthes", "人民邮电出版社", "计算机", 2016, "A-01-03", 5),
-    ("9787111544937", "深入理解计算机系统", "Randal E. Bryant", "机械工业出版社", "计算机", 2016, "A-01-05", 3),
-    ("9787111213826", "算法导论", "Thomas H. Cormen", "机械工业出版社", "计算机", 2013, "A-02-01", 2),
-    ("9787121362217", "重构：改善既有代码的设计", "Martin Fowler", "电子工业出版社", "计算机", 2019, "A-02-04", 4),
-    ("9787115546081", "流畅的 Python", "Luciano Ramalho", "人民邮电出版社", "计算机", 2020, "A-02-07", 3),
-    ("9787506365437", "活着", "余华", "作家出版社", "文学", 2012, "B-01-01", 6),
-    ("9787020002207", "红楼梦", "曹雪芹", "人民文学出版社", "文学", 1996, "B-01-04", 4),
-    ("9787532776634", "百年孤独", "加西亚·马尔克斯", "南海出版公司", "文学", 2017, "B-01-08", 3),
-    ("9787544270878", "解忧杂货店", "东野圭吾", "南海出版公司", "文学", 2014, "B-02-02", 5),
-    ("9787208061644", "万历十五年", "黄仁宇", "上海人民出版社", "历史", 2007, "C-01-02", 3),
-    ("9787508647357", "人类简史", "尤瓦尔·赫拉利", "中信出版社", "历史", 2014, "C-01-05", 4),
-    ("9787521701067", "枪炮、病菌与钢铁", "贾雷德·戴蒙德", "中信出版社", "历史", 2022, "C-01-09", 2),
-    ("9787508660752", "国富论", "亚当·斯密", "中信出版社", "经济", 2016, "D-01-01", 2),
-    ("9787521717716", "穷查理宝典", "彼得·考夫曼", "中信出版社", "经济", 2021, "D-01-03", 3),
-    ("9787115479440", "经济学原理", "曼昆", "人民邮电出版社", "经济", 2018, "D-01-06", 4),
-    ("9787544253994", "挪威的森林", "村上春树", "南海出版公司", "文学", 2011, "B-02-05", 3),
-    ("9787540488069", "月亮与六便士", "毛姆", "湖南文艺出版社", "文学", 2018, "B-02-08", 4),
-    ("9787115473899", "数学之美", "吴军", "人民邮电出版社", "科普", 2020, "E-01-02", 3),
-    ("9787535732309", "时间简史", "史蒂芬·霍金", "湖南科学技术出版社", "科普", 2010, "E-01-04", 2),
-    ("9787521708462", "宇宙的琴弦", "布莱恩·格林", "中信出版社", "科普", 2019, "E-01-07", 2),
-    ("9787115373991", "代码整洁之道", "Robert C. Martin", "人民邮电出版社", "计算机", 2015, "A-03-01", 3),
-    ("9787020104345", "平凡的世界", "路遥", "人民文学出版社", "文学", 2017, "B-03-01", 5),
-    ("9787544291170", "白夜行", "东野圭吾", "南海出版公司", "文学", 2015, "B-03-04", 4),
-    ("9787521701883", "原则", "瑞·达利欧", "中信出版社", "经济", 2018, "D-02-02", 3),
-]
 
 MEMBERS = [
     ("2024001", "李思远", "13800001111", "lisiyuan@example.com", "学生"),
@@ -74,21 +49,33 @@ def seed(force: bool = False) -> bool:
             conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('loans','books','members')")
 
         book_ids: list[tuple[int, int]] = []
-        for isbn, title, author, publisher, category, year, location, total in BOOKS:
+        for isbn, title, author, publisher, category, year, location, total, description in BOOKS:
             cur = conn.execute(
                 "INSERT INTO books (isbn, title, author, publisher, category, publish_year, location, "
-                "                   total_copies, available_copies) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [isbn, title, author, publisher, category, year, location, total, total],
+                "                   description, total_copies, available_copies) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [isbn, title, author, publisher, category, year, location, description, total, total],
             )
-            book_ids.append((int(cur.lastrowid), total))
+            book_id = int(cur.lastrowid)
+            # 馆藏条码：默认 BK + 7 位序号，与图书 id 对齐
+            conn.execute("UPDATE books SET barcode = ? WHERE id = ?", [barcode.generate(book_id), book_id])
+            book_ids.append((book_id, total))
 
         member_ids: list[int] = []
         for card_no, name, phone, email, member_type in MEMBERS:
+            # 演示数据同步开通门户账号，初始密码 = 证号后 6 位
             cur = conn.execute(
-                "INSERT INTO members (card_no, name, phone, email, member_type, status, max_borrow) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?)",
-                [card_no, name, phone, email, member_type, 5 if member_type == "学生" else 10],
+                "INSERT INTO members (card_no, name, phone, email, member_type, status, max_borrow, password_hash) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                [
+                    card_no,
+                    name,
+                    phone,
+                    email,
+                    member_type,
+                    5 if member_type == "学生" else 10,
+                    hash_password(initial_password(card_no)),
+                ],
             )
             member_ids.append(int(cur.lastrowid))
 
@@ -132,5 +119,29 @@ def seed(force: bool = False) -> bool:
                 [open_count, book_id],
             )
 
-    logger.info("演示数据写入完成", extra={"extra_fields": {"books": len(BOOKS), "members": len(MEMBERS), "loans": len(plans)}})
+    logger.info(
+        "演示数据写入完成",
+        extra={"extra_fields": {"books": len(BOOKS), "members": len(MEMBERS), "loans": len(plans)}},
+    )
     return True
+
+
+def ensure_content() -> int:
+    """为演示书目回填简介（仅补空值，幂等）。
+
+    老库升级后已有书目没有简介，这里按 ISBN 与演示目录比对补齐，
+    只影响简介为空的记录，不会覆盖馆员已录入的内容。返回回填条数。
+    """
+    updated = 0
+    with db.transaction() as conn:
+        for isbn, description in DESCRIPTIONS_BY_ISBN.items():
+            cur = conn.execute(
+                "UPDATE books SET description = ?, updated_at = datetime('now', 'localtime') "
+                " WHERE isbn = ? AND (description IS NULL OR description = '')",
+                [description, isbn],
+            )
+            updated += max(0, int(cur.rowcount or 0))
+
+    if updated:
+        logger.info("演示简介回填完成", extra={"extra_fields": {"books": updated}})
+    return updated

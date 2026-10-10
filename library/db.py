@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 from config import get_config
+from library.barcode import generate
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +20,14 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS books (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     isbn             TEXT    NOT NULL UNIQUE,
+    barcode          TEXT    NOT NULL DEFAULT '',
     title            TEXT    NOT NULL,
     author           TEXT    NOT NULL DEFAULT '',
     publisher        TEXT    NOT NULL DEFAULT '',
     category         TEXT    NOT NULL DEFAULT '未分类',
     publish_year     INTEGER,
     location         TEXT    NOT NULL DEFAULT '',
+    description      TEXT    NOT NULL DEFAULT '',
     total_copies     INTEGER NOT NULL DEFAULT 1 CHECK (total_copies >= 0),
     available_copies INTEGER NOT NULL DEFAULT 1 CHECK (available_copies >= 0),
     created_at       TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
@@ -40,6 +43,8 @@ CREATE TABLE IF NOT EXISTS members (
     member_type   TEXT    NOT NULL DEFAULT '普通',
     status        TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'frozen')),
     max_borrow    INTEGER NOT NULL DEFAULT 5 CHECK (max_borrow >= 1),
+    password_hash TEXT    NOT NULL DEFAULT '',
+    last_login_at TEXT,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -71,6 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_books_category   ON books(category);
 CREATE INDEX IF NOT EXISTS idx_books_author     ON books(author);
 CREATE INDEX IF NOT EXISTS idx_members_name     ON members(name);
 CREATE INDEX IF NOT EXISTS idx_members_card     ON members(card_no);
+CREATE INDEX IF NOT EXISTS idx_members_phone    ON members(phone);
 CREATE INDEX IF NOT EXISTS idx_loans_book       ON loans(book_id);
 CREATE INDEX IF NOT EXISTS idx_loans_member     ON loans(member_id);
 CREATE INDEX IF NOT EXISTS idx_loans_open       ON loans(returned_at, due_at);
@@ -178,8 +184,77 @@ def executemany(sql: str, seq: Iterable[Sequence[Any]]) -> None:
 
 
 def init_db() -> None:
-    """建表 + 建索引（幂等）。"""
+    """建表 + 建索引 + 增量迁移（幂等）。"""
     conn = get_conn()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     logger.info("数据库已就绪", extra={"extra_fields": {"db_path": get_config().db_path}})
+
+
+# 老库升级用的增量迁移：新库由 SCHEMA 直接建全，这里只补历史库缺的列。
+# 每条迁移都是幂等的（先查 PRAGMA 再决定加不加），可安全重复执行。
+_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("members", "password_hash", "ALTER TABLE members ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"),
+    ("members", "last_login_at", "ALTER TABLE members ADD COLUMN last_login_at TEXT"),
+    ("books", "barcode", "ALTER TABLE books ADD COLUMN barcode TEXT NOT NULL DEFAULT ''"),
+    ("books", "description", "ALTER TABLE books ADD COLUMN description TEXT NOT NULL DEFAULT ''"),
+)
+
+# 条码唯一索引必须晚于「列创建 + 存量回填」执行，因此不放进 SCHEMA，
+# 由 _migrate 在回填之后幂等创建。
+_BARCODE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_books_barcode ON books(barcode) WHERE barcode <> ''"
+)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    try:
+        return {str(row[1]) for row in cur.fetchall()}
+    finally:
+        cur.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        if column in _table_columns(conn, table):
+            continue
+        conn.execute(ddl)
+        logger.info(
+            "数据库迁移完成",
+            extra={"extra_fields": {"table": table, "added_column": column}},
+        )
+    _backfill_barcodes(conn)
+    conn.execute(_BARCODE_INDEX_SQL)
+
+
+def _backfill_barcodes(conn: sqlite3.Connection) -> None:
+    """为缺条码的图书补生成馆藏条码号（幂等）。
+
+    条码号默认取「BK + 7 位序号」，序号优先复用自己的图书 id；
+    若该号已被手工占用则顺延到第一个未占用的序号。
+    """
+    rows = conn.execute("SELECT id FROM books WHERE barcode IS NULL OR barcode = '' ORDER BY id").fetchall()
+    if not rows:
+        return
+
+    used = {
+        str(row[0]).upper()
+        for row in conn.execute("SELECT barcode FROM books WHERE barcode <> ''").fetchall()
+    }
+    seq = 1
+    for row in rows:
+        book_id = int(row[0])
+        candidate = generate(book_id)
+        if candidate in used:
+            while generate(seq) in used:
+                seq += 1
+            candidate = generate(seq)
+        used.add(candidate)
+        conn.execute("UPDATE books SET barcode = ? WHERE id = ?", [candidate, book_id])
+
+    logger.info(
+        "数据库迁移完成",
+        extra={"extra_fields": {"table": "books", "backfilled_barcodes": len(rows)}},
+    )

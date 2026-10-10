@@ -7,8 +7,8 @@ from typing import Any, Mapping
 from library import db
 
 _PUBLIC_COLUMNS = (
-    "id, isbn, title, author, publisher, category, publish_year, location, "
-    "total_copies, available_copies"
+    "id, isbn, barcode, title, author, publisher, category, publish_year, location, "
+    "description, total_copies, available_copies"
 )
 
 
@@ -18,9 +18,12 @@ def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
 
     keyword = (filters.get("keyword") or "").strip()
     if keyword:
-        clauses.append("(title LIKE ? OR author LIKE ? OR publisher LIKE ? OR isbn LIKE ? OR category LIKE ?)")
+        clauses.append(
+            "(title LIKE ? OR author LIKE ? OR publisher LIKE ? OR isbn LIKE ? "
+            " OR barcode LIKE ? OR category LIKE ?)"
+        )
         like = f"%{keyword}%"
-        params.extend([like, like, like, like, like])
+        params.extend([like, like, like, like, like, like])
 
     category = (filters.get("category") or "").strip()
     if category:
@@ -71,8 +74,8 @@ def recommended(limit: int = 6) -> list[dict[str, Any]]:
     """推荐口径：优先推荐「有可借库存 + 分类内借阅热度高」的书。"""
     return db.query_all(
         f"""
-        SELECT b.id, b.isbn, b.title, b.author, b.publisher, b.category, b.publish_year,
-               b.location, b.total_copies, b.available_copies,
+        SELECT b.id, b.isbn, b.barcode, b.title, b.author, b.publisher, b.category,
+               b.publish_year, b.location, b.description, b.total_copies, b.available_copies,
                COALESCE(l.loan_count, 0) AS loan_count
           FROM books b
           LEFT JOIN (SELECT book_id, COUNT(*) AS loan_count FROM loans GROUP BY book_id) l

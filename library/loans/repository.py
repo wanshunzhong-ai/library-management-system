@@ -10,6 +10,7 @@ _SELECT = """
 SELECT l.id, l.book_id, l.member_id, l.borrowed_at, l.due_at, l.returned_at,
        l.renew_count, l.note,
        b.isbn       AS book_isbn,
+       b.barcode    AS book_barcode,
        b.title      AS book_title,
        b.author     AS book_author,
        b.category   AS book_category,
@@ -46,9 +47,11 @@ def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
 
     keyword = (filters.get("keyword") or "").strip()
     if keyword:
-        clauses.append("(b.title LIKE ? OR b.isbn LIKE ? OR m.name LIKE ? OR m.card_no LIKE ?)")
+        clauses.append(
+            "(b.title LIKE ? OR b.isbn LIKE ? OR b.barcode LIKE ? OR m.name LIKE ? OR m.card_no LIKE ?)"
+        )
         like = f"%{keyword}%"
-        params.extend([like, like, like, like])
+        params.extend([like, like, like, like, like])
 
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     return where, params

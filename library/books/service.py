@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from library import barcode as barcode_util
 from library import db
 from library.books import repository as repo
 from library.errors import ConflictError, NotFoundError, ValidationError
@@ -17,6 +18,8 @@ from library.validation import (
 )
 
 MAX_YEAR = 2100
+MAX_DESCRIPTION = 1000
+MAX_BARCODE_SEQ = 10_000_000
 
 
 def _normalize(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -28,16 +31,38 @@ def _normalize(payload: Mapping[str, Any]) -> dict[str, Any]:
     total_copies = require_int(payload, "total_copies", label="总册数", minimum=1, maximum=9999)
     publish_year = optional_int(payload, "publish_year", label="出版年份", minimum=1000, maximum=MAX_YEAR)
 
+    barcode = barcode_util.normalize(optional_str(payload, "barcode", label="馆藏条码", max_length=64))
+    if barcode and not barcode_util.is_valid(barcode):
+        raise ValidationError(
+            "馆藏条码需为 4–32 位字母、数字或连字符", details={"field": "barcode"}
+        )
+
     return {
         "isbn": isbn,
+        "barcode": barcode,
         "title": require_str(payload, "title", label="书名", max_length=200),
         "author": optional_str(payload, "author", label="作者", max_length=100),
         "publisher": optional_str(payload, "publisher", label="出版社", max_length=100),
         "category": optional_str(payload, "category", label="分类", max_length=50) or "未分类",
         "publish_year": publish_year,
         "location": optional_str(payload, "location", label="馆藏位置", max_length=50),
+        "description": optional_str(
+            payload, "description", label="图书简介", max_length=MAX_DESCRIPTION
+        ),
         "total_copies": total_copies,
     }
+
+
+def _allocate_barcode(book_id: int) -> str:
+    """为新书分配条码号：优先用图书 id，被占用则顺延到第一个空位。"""
+    candidate = barcode_util.generate(book_id)
+    if not repo.exists_barcode(candidate, exclude_id=book_id):
+        return candidate
+    for seq in range(1, MAX_BARCODE_SEQ):
+        candidate = barcode_util.generate(seq)
+        if not repo.exists_barcode(candidate, exclude_id=book_id):
+            return candidate
+    raise ConflictError("条码号已用尽，请手工指定馆藏条码")
 
 
 def list_books(query: Mapping[str, Any]) -> dict[str, Any]:
@@ -70,8 +95,16 @@ def create_book(payload: Mapping[str, Any]) -> dict[str, Any]:
     data = _normalize(payload)
     if repo.exists_isbn(data["isbn"]):
         raise ConflictError(f"ISBN {data['isbn']} 已存在", details={"field": "isbn"})
+    if data["barcode"] and repo.exists_barcode(data["barcode"]):
+        raise ConflictError(
+            f"馆藏条码 {data['barcode']} 已被其它图书占用", details={"field": "barcode"}
+        )
+
     data["available_copies"] = data["total_copies"]
     book_id = repo.insert(data)
+    if not data["barcode"]:
+        # 条码号需要图书 id 才能生成，插入后回写
+        repo.set_barcode(book_id, _allocate_barcode(book_id))
     return get_book(book_id)
 
 
@@ -83,6 +116,14 @@ def update_book(book_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
     data = _normalize(payload)
     if repo.exists_isbn(data["isbn"], exclude_id=book_id):
         raise ConflictError(f"ISBN {data['isbn']} 已被其它图书占用", details={"field": "isbn"})
+
+    # 条码留空表示沿用原条码，不会把已有条码清空
+    barcode = data["barcode"] or str(current.get("barcode") or "")
+    if not barcode:
+        barcode = _allocate_barcode(book_id)
+    if repo.exists_barcode(barcode, exclude_id=book_id):
+        raise ConflictError(f"馆藏条码 {barcode} 已被其它图书占用", details={"field": "barcode"})
+    data["barcode"] = barcode
 
     active = repo.active_loan_count(book_id)
     if data["total_copies"] < active:

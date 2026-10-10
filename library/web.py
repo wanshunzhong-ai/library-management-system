@@ -13,6 +13,8 @@ from library import db
 from library.auth import service as auth_service
 from library.errors import AppError
 from library.logging_conf import init_logging, register_request_logging
+from library.members import service as member_service
+from library.reader import service as reader_service
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,14 @@ def create_app(config: Config | None = None) -> Flask:
     with app.app_context():
         db.init_db()
         auth_service.ensure_default_admin()
+        member_service.ensure_reader_accounts()
+        # 老库升级后补上演示书目简介（仅补空值，失败不阻塞启动）
+        try:
+            from library import seed as seed_module
+
+            seed_module.ensure_content()
+        except Exception:  # noqa: BLE001 - 回填属增强逻辑，不应拖垮启动
+            logger.warning("演示简介回填失败，已跳过", exc_info=True)
 
     return app
 
@@ -63,9 +73,11 @@ def _register_blueprints(app: Flask) -> None:
     from library.loans import bp as loans_bp
     from library.members import bp as members_bp
     from library.public import bp as public_bp
+    from library.reader import bp as reader_bp
 
     app.register_blueprint(public_bp)
     app.register_blueprint(auth_bp)
+    app.register_blueprint(reader_bp)
     app.register_blueprint(books_bp)
     app.register_blueprint(members_bp)
     app.register_blueprint(loans_bp)
@@ -73,7 +85,14 @@ def _register_blueprints(app: Flask) -> None:
 
 
 def _register_guard(app: Flask) -> None:
-    """统一守卫：/api/ 下除公开接口外全部要求登录；写操作校验 CSRF。"""
+    """统一守卫，按路径前缀区分三类接口。
+
+    1. `/api/reader/*`  —— 读者门户：只认读者会话，写操作校验读者 CSRF；
+    2. `/api/public/*` 与登录相关 —— 免登录；
+    3. 其余 `/api/*`    —— 后台管理：只认管理员会话，写操作校验管理员 CSRF。
+
+    管理员与读者使用互相独立的两套会话键与 CSRF token，可同时登录互不顶掉。
+    """
     public_prefixes = auth_service.PUBLIC_API_PREFIXES
     public_endpoints = auth_service.PUBLIC_API_ENDPOINTS
 
@@ -84,6 +103,17 @@ def _register_guard(app: Flask) -> None:
             return None
 
         endpoint = request.endpoint or ""
+
+        if path.startswith("/api/reader/"):
+            if endpoint in reader_service.PUBLIC_ENDPOINTS:
+                return None
+            if reader_service.current_reader() is None:
+                return (
+                    jsonify({"error": {"code": "unauthorized", "message": "请先登录读者账号"}}),
+                    401,
+                )
+            return reader_service.csrf_protect()
+
         if path.startswith(public_prefixes) or endpoint in public_endpoints:
             return None
 

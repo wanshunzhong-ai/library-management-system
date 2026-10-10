@@ -61,6 +61,12 @@
   const state = { keyword: "", category: "", availableOnly: false, page: 1, pageSize: 8 };
   let searchStarted = false;
 
+  /* 已渲染过的书目：详情弹窗直接取用，避免二次请求 */
+  const bookCache = new Map();
+  let lastFocused = null;
+
+  const cacheBooks = (list) => (list || []).forEach((b) => bookCache.set(String(b.id), b));
+
   /* ---------------- 概览 ---------------- */
 
   function renderStats(stats) {
@@ -101,10 +107,13 @@
   }
 
   function bookCard(b) {
+    const avail = Number(b.available_copies) || 0;
     const badge = b.available
       ? `<span class="badge badge-ok">${esc(b.status_label)}</span>`
       : `<span class="badge badge-danger">全部借出</span>`;
-    return `<article class="book-card">
+    const meta = [b.category, b.publisher || "—", b.publish_year ? String(b.publish_year) : ""].filter(Boolean);
+    return `<article class="book-card" data-book="${esc(b.id)}" tabindex="0" role="button"
+      aria-label="查看《${esc(b.title)}》的内容简介与馆藏条码">
       <div class="bc-top">
         <div>
           <div class="bc-title">${esc(b.title)}</div>
@@ -112,22 +121,103 @@
         </div>
         ${badge}
       </div>
+      <p class="bc-desc${b.description ? "" : " is-empty"}">${esc(b.description || "本馆暂未录入这本书的内容简介")}</p>
       <div class="bc-meta">
-        <span>${esc(b.category)}</span>
-        <span>${esc(b.publisher || "—")}</span>
-        ${b.publish_year ? `<span>${esc(b.publish_year)}</span>` : ""}
+        ${meta.map((m) => `<span>${esc(m)}</span>`).join("")}
+        ${b.barcode ? `<span class="bc-code">条码 ${esc(b.barcode)}</span>` : ""}
       </div>
       <div class="bc-foot">
         <span class="shelf">馆藏位置 <b>${esc(b.location || "待分配")}</b></span>
-        <span class="badge badge-muted">${Number(b.available_copies) || 0}/${Number(b.total_copies) || 0} 册</span>
+        <span class="bc-foot-right">
+          <span class="badge badge-muted">${avail}/${Number(b.total_copies) || 0} 册</span>
+          <span class="bc-more">详情 ›</span>
+        </span>
       </div>
     </article>`;
   }
 
   function renderCards(container, list, emptyText) {
+    cacheBooks(list);
     container.innerHTML = list.length
       ? list.map(bookCard).join("")
       : `<div class="empty-state"><p>${esc(emptyText)}</p></div>`;
+    bindCardClicks(container);
+  }
+
+  /** 整张书卡可点：打开详情弹窗（事件委托只绑一次） */
+  function bindCardClicks(container) {
+    if (container.dataset.cardBound === "1") return;
+    container.dataset.cardBound = "1";
+    const open = (event) => {
+      const card = event.target.closest(".book-card");
+      if (card && card.dataset.book) openBookModal(card.dataset.book);
+    };
+    container.addEventListener("click", open);
+    container.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        const card = event.target.closest(".book-card");
+        if (card) {
+          event.preventDefault();
+          openBookModal(card.dataset.book);
+        }
+      }
+    });
+  }
+
+  /* ---------------- 图书详情弹窗（简介 + 馆藏条码） ---------------- */
+
+  function detailHtml(b) {
+    const avail = Number(b.available_copies) || 0;
+    const total = Number(b.total_copies) || 0;
+    const badge = b.available
+      ? `<span class="badge ${avail === 1 ? "badge-warn" : "badge-ok"}">${esc(b.status_label)}</span>`
+      : `<span class="badge badge-danger">全部借出</span>`;
+    return `<div class="bk-detail">
+      <div class="bk-detail-main">
+        <h4>《${esc(b.title)}》</h4>
+        <div class="bk-detail-sub">
+          ${esc(b.author || "佚名")} · ${esc(b.publisher || "未标注出版社")}${b.publish_year ? ` · ${esc(b.publish_year)} 年` : ""}
+        </div>
+        <div class="bk-tags">
+          <span class="badge badge-muted">${esc(b.category)}</span>
+          ${badge}
+          <span class="badge badge-muted">馆藏位置 ${esc(b.location || "待分配")}</span>
+        </div>
+        <p class="bk-desc-full${b.description ? "" : " is-empty"}">${esc(
+          b.description || "本馆暂未录入这本书的内容简介，可到馆向馆员咨询。"
+        )}</p>
+        <div class="bk-meta">
+          <div><span>馆藏条码</span><b class="mono">${esc(b.barcode || "—")}</b></div>
+          <div><span>ISBN</span><b class="mono">${esc(b.isbn)}</b></div>
+          <div><span>馆藏册数</span><b>可借 ${avail} / 共 ${total} 册</b></div>
+        </div>
+      </div>
+      <div class="bk-code-box">
+        ${b.barcode
+          ? Barcode.svg(b.barcode, { height: 52 })
+          : '<div class="bk-code-tip">该书尚未设置条码</div>'}
+        <div class="bk-code-tip">到馆报此条码可快速找书</div>
+      </div>
+    </div>`;
+  }
+
+  function openBookModal(id) {
+    const book = bookCache.get(String(id));
+    if (!book) {
+      toast("无法打开详情", "请重新检索后再试", "error");
+      return;
+    }
+    lastFocused = document.activeElement;
+    $("#bookModalTitle").textContent = "图书详情";
+    $("#bookModalBody").innerHTML = detailHtml(book);
+    $("#bookModal").hidden = false;
+    $("#bookModalClose").focus();
+  }
+
+  function closeBookModal() {
+    $("#bookModal").hidden = true;
+    $("#bookModalBody").innerHTML = "";
+    if (lastFocused && lastFocused.focus) lastFocused.focus();
   }
 
   function renderRules(rules) {
@@ -166,6 +256,7 @@
     const table = $("#searchTable");
     wrap.hidden = false;
     $("#searchEmpty").hidden = true;
+    cacheBooks(payload.items);
 
     if (!payload.items.length) {
       wrap.hidden = true;
@@ -180,7 +271,7 @@
 
     table.innerHTML = `
       <thead><tr>
-        <th>书名 / 作者</th><th>出版社</th><th>分类</th><th>馆藏位置</th><th>在架状态</th><th>馆藏册数</th>
+        <th>书名 / 作者</th><th>馆藏条码</th><th>出版社</th><th>分类</th><th>馆藏位置</th><th>在架状态</th><th>馆藏册数</th><th>详情</th>
       </tr></thead>
       <tbody>${payload.items
         .map((b) => {
@@ -189,11 +280,13 @@
             : `<span class="badge badge-danger">全部借出</span>`;
           return `<tr>
             <td><strong>${esc(b.title)}</strong><div class="sub">${esc(b.author || "佚名")} · ${esc(b.isbn)}</div></td>
+            <td>${b.barcode ? `<span class="barcode-tag">${esc(b.barcode)}</span>` : '<span class="sub">—</span>'}</td>
             <td>${esc(b.publisher || "—")}${b.publish_year ? `<div class="sub">${esc(b.publish_year)} 年</div>` : ""}</td>
             <td><span class="badge badge-muted">${esc(b.category)}</span></td>
             <td class="mono">${esc(b.location || "待分配")}</td>
             <td>${badge}</td>
             <td class="mono">${Number(b.available_copies) || 0} / ${Number(b.total_copies) || 0}</td>
+            <td><button type="button" class="row-detail" data-book="${esc(b.id)}">简介</button></td>
           </tr>`;
         })
         .join("")}</tbody>`;
@@ -238,6 +331,86 @@
     }
   }
 
+  /* ---------------- 统一登录 ---------------- */
+
+  function loginError(message, field) {
+    const box = $("#portalLoginError");
+    if (!message) {
+      box.hidden = true;
+      box.textContent = "";
+    } else {
+      box.hidden = false;
+      box.textContent = message;
+    }
+    ["#plFieldAccount", "#plFieldPassword"].forEach((sel) => $(sel).classList.remove("has-error"));
+    if (field === "identifier" || field === "account" || field === "username") $("#plFieldAccount").classList.add("has-error");
+    if (field === "password") $("#plFieldPassword").classList.add("has-error");
+  }
+
+  /** 登录后的落点：只认与当前身份匹配的站内相对地址，避免开放重定向 */
+  function targetAfterLogin(payload) {
+    const home = payload.redirect || "/";
+    const raw = new URLSearchParams(location.search).get("next") || "";
+    if (!raw.startsWith("/") || raw.startsWith("//")) return home;
+    if (payload.role === "admin" && raw.startsWith("/admin")) return raw;
+    if (payload.role === "reader" && raw.startsWith("/reader")) return raw;
+    return home;
+  }
+
+  function bindLogin() {
+    const form = $("#portalLoginForm");
+    if (!form) return;
+    const btn = $("#portalLoginBtn");
+    const pw = $("#portalPassword");
+
+    $("#portalPwToggle").addEventListener("click", () => {
+      const showing = pw.type === "text";
+      pw.type = showing ? "password" : "text";
+      $("#portalPwToggle").textContent = showing ? "显示" : "隐藏";
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      loginError("");
+
+      const identifier = $("#portalIdentifier").value.trim();
+      const password = pw.value;
+      if (!identifier) return loginError("请输入账号", "identifier");
+      if (!password) return loginError("请输入密码", "password");
+
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "登录中…";
+
+      try {
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ identifier, password }),
+        });
+        const text = await response.text();
+        let payload = null;
+        if (text) { try { payload = JSON.parse(text); } catch (err) { payload = null; } }
+
+        if (!response.ok) {
+          const errObj = (payload && payload.error) || {};
+          loginError(errObj.message || `登录失败（HTTP ${response.status}）`, errObj.details && errObj.details.field);
+          btn.disabled = false;
+          btn.textContent = original;
+          return;
+        }
+
+        const label = payload.role === "admin" ? "管理员" : "读者";
+        btn.textContent = `${label}登录成功，正在进入…`;
+        location.replace(targetAfterLogin(payload));
+      } catch (err) {
+        loginError("无法连接服务器，请确认服务是否在运行");
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    });
+  }
+
   /* ---------------- 事件 ---------------- */
 
   function bind() {
@@ -247,7 +420,6 @@
       state.page = 1;
       runSearch();
     });
-
     $("#q").addEventListener("input", debounce((e) => {
       const value = e.target.value.trim();
       if (!value && !searchStarted) return;
@@ -267,10 +439,26 @@
       state.page = 1;
       if (searchStarted || state.keyword) runSearch();
     });
+
+    // 检索结果里的「简介」按钮
+    $("#searchTable").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-book]");
+      if (btn) openBookModal(btn.dataset.book);
+    });
+
+    // 详情弹窗：关闭按钮 / 遮罩 / Esc
+    $("#bookModalClose").addEventListener("click", closeBookModal);
+    $("#bookModal").addEventListener("click", (e) => {
+      if (e.target === $("#bookModal")) closeBookModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("#bookModal").hidden) closeBookModal();
+    });
   }
 
   document.addEventListener("DOMContentLoaded", () => {
     bind();
+    bindLogin();
     loadOverview().catch((err) => toast("内容加载失败", err.message, "error"));
   });
 })();

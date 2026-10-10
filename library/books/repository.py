@@ -7,8 +7,8 @@ from typing import Any, Mapping, Sequence
 from library import db
 
 _COLUMNS = (
-    "id, isbn, title, author, publisher, category, publish_year, "
-    "location, total_copies, available_copies, created_at, updated_at"
+    "id, isbn, barcode, title, author, publisher, category, publish_year, "
+    "location, description, total_copies, available_copies, created_at, updated_at"
 )
 
 
@@ -18,9 +18,11 @@ def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
 
     keyword = (filters.get("keyword") or "").strip()
     if keyword:
-        clauses.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR publisher LIKE ?)")
+        clauses.append(
+            "(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR barcode LIKE ? OR publisher LIKE ?)"
+        )
         like = f"%{keyword}%"
-        params.extend([like, like, like, like])
+        params.extend([like, like, like, like, like])
 
     category = (filters.get("category") or "").strip()
     if category:
@@ -58,13 +60,23 @@ def exists_isbn(isbn: str, *, exclude_id: int | None = None) -> bool:
     return bool(db.query_scalar("SELECT 1 FROM books WHERE isbn = ? AND id <> ? LIMIT 1", [isbn, exclude_id]))
 
 
+def exists_barcode(code: str, *, exclude_id: int | None = None) -> bool:
+    if not code:
+        return False
+    if exclude_id is None:
+        return bool(db.query_scalar("SELECT 1 FROM books WHERE barcode = ? LIMIT 1", [code]))
+    return bool(
+        db.query_scalar("SELECT 1 FROM books WHERE barcode = ? AND id <> ? LIMIT 1", [code, exclude_id])
+    )
+
+
 def insert(payload: Mapping[str, Any]) -> int:
     return db.execute(
         """
-        INSERT INTO books (isbn, title, author, publisher, category, publish_year,
-                           location, total_copies, available_copies)
-        VALUES (:isbn, :title, :author, :publisher, :category, :publish_year,
-                :location, :total_copies, :available_copies)
+        INSERT INTO books (isbn, barcode, title, author, publisher, category, publish_year,
+                           location, description, total_copies, available_copies)
+        VALUES (:isbn, :barcode, :title, :author, :publisher, :category, :publish_year,
+                :location, :description, :total_copies, :available_copies)
         """,
         dict(payload),
     )
@@ -76,14 +88,34 @@ def update(book_id: int, payload: Mapping[str, Any]) -> None:
     db.execute(
         """
         UPDATE books SET
-            isbn = :isbn, title = :title, author = :author, publisher = :publisher,
-            category = :category, publish_year = :publish_year, location = :location,
+            isbn = :isbn, barcode = :barcode, title = :title, author = :author,
+            publisher = :publisher, category = :category, publish_year = :publish_year,
+            location = :location, description = :description,
             total_copies = :total_copies, available_copies = :available_copies,
             updated_at = datetime('now', 'localtime')
         WHERE id = :id
         """,
         data,
     )
+
+
+def set_barcode(book_id: int, code: str) -> None:
+    """补写条码号（新增图书时按 id 生成后回写）。"""
+    db.execute(
+        "UPDATE books SET barcode = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [code, book_id],
+    )
+
+
+def fill_description_if_empty(isbn: str, description: str) -> int:
+    """仅当简介为空时写入，返回受影响行数（老库回填用）。"""
+    with db.transaction() as conn:
+        cur = conn.execute(
+            "UPDATE books SET description = ?, updated_at = datetime('now', 'localtime') "
+            " WHERE isbn = ? AND (description IS NULL OR description = '')",
+            [description, isbn],
+        )
+        return max(0, int(cur.rowcount or 0))
 
 
 def delete(book_id: int) -> None:
