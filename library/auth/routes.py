@@ -10,7 +10,9 @@ from urllib.parse import quote
 from flask import Blueprint, jsonify, redirect, request, url_for
 
 from config import get_config
+from library import audit
 from library.auth import service
+from library.auth.permissions import capabilities_payload, role_label
 
 bp = Blueprint("auth", __name__)
 
@@ -26,16 +28,45 @@ def login_page():
     return redirect(target)
 
 
+def _admin_actor(admin: dict) -> dict:
+    return {
+        "actor_type": "admin",
+        "actor_id": admin.get("id"),
+        "actor_name": admin.get("display_name") or admin.get("username") or "",
+        "actor_role": admin.get("role") or "",
+    }
+
+
 @bp.post("/api/auth/login")
 def login():
     """统一登录：一份账号密码，自动识别管理员或读者。"""
     payload = request.get_json(silent=True) or {}
-    return jsonify(service.login_unified(payload, service.client_ip()))
+    result = service.login_unified(payload, service.client_ip())
+    if result.get("role") == "admin":
+        admin = result.get("admin") or {}
+        # 登录本身也是审计事件：需要能看到"谁在什么时候进了后台"
+        audit.log(
+            "auth.login",
+            entity="account",
+            entity_id=admin.get("id"),
+            summary=f"{role_label(str(admin.get('role') or ''))}「{admin.get('display_name') or admin.get('username')}」登录后台",
+            actor=_admin_actor(admin),
+        )
+    return jsonify(result)
 
 
 @bp.post("/api/auth/logout")
 def logout():
+    admin = service.current_admin()
     service.logout()
+    if admin:
+        audit.log(
+            "auth.logout",
+            entity="account",
+            entity_id=admin.get("id"),
+            summary=f"「{admin.get('display_name') or admin.get('username')}」退出登录",
+            actor=_admin_actor(admin),
+        )
     return jsonify({"ok": True})
 
 
@@ -45,9 +76,13 @@ def me():
     if admin is None:
         return jsonify({"error": {"code": "unauthorized", "message": "未登录"}}), 401
     cfg = get_config()
+    role = str(admin.get("role") or "")
     return jsonify(
         {
             "admin": admin,
+            "role_label": role_label(role),
+            # 前端据此隐藏/禁用无权入口；后端仍然独立校验，前端只是"不给出入口"
+            "permissions": capabilities_payload(role),
             "csrf_token": service.csrf_token(),
             "library": {"name": cfg.library_name, "slogan": cfg.library_slogan},
             "security": service.security_status(admin),
@@ -80,6 +115,13 @@ def change_password():
         admin["id"],
         str(payload.get("old_password") or ""),
         str(payload.get("new_password") or ""),
+    )
+    audit.log(
+        "auth.password",
+        entity="account",
+        entity_id=admin.get("id"),
+        summary=f"「{admin.get('display_name') or admin.get('username')}」修改了自己的登录密码",
+        actor=_admin_actor(admin),
     )
     service.logout()
     return jsonify({"ok": True, "message": "密码已修改，请使用新密码重新登录"})

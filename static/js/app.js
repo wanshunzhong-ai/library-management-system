@@ -147,7 +147,12 @@
     }
   }
 
-  const auth = { csrf: null, admin: null, redirecting: false };
+  const auth = { csrf: null, admin: null, redirecting: false, permissions: [], roleLabel: "" };
+
+  /** 当前登录账号是否具备某项能力。权限列表来自 /api/auth/me。 */
+  function can(capability) {
+    return auth.permissions.indexOf(capability) !== -1;
+  }
 
   function handleUnauthorized() {
     if (auth.redirecting) return;
@@ -339,11 +344,15 @@
 
   /* ---------------- 视图元数据 ---------------- */
 
+  // permission 字段存在的视图表示「需要该权限才看得到」：缺权限时导航入口隐藏、
+  // 手改 hash 也会被挡回概览。后端对这些接口独立校验，前端只是不给出入口。
   const VIEWS = {
     dashboard: { title: "概览", sub: "馆藏与流通实时概况" },
     books: { title: "图书管理", sub: "维护馆藏书目与库存" },
     members: { title: "读者管理", sub: "维护读者档案与借阅权限" },
     loans: { title: "借阅管理", sub: "办理借书、还书与续借" },
+    accounts: { title: "账号管理", sub: "后台账号、角色与启停用", permission: "account:manage" },
+    logs: { title: "操作日志", sub: "谁在什么时候改了什么", permission: "log:read" },
   };
 
   const state = {
@@ -351,6 +360,8 @@
     books: { page: 1, pageSize: 10, keyword: "", category: "", availableOnly: false, sort: "", order: "" },
     members: { page: 1, pageSize: 10, keyword: "", status: "", sort: "", order: "" },
     loans: { page: 1, pageSize: 10, keyword: "", status: "all", sort: "", order: "" },
+    accounts: { keyword: "" },
+    logs: { page: 1, pageSize: 20, keyword: "", actorType: "", action: "", status: "" },
     categories: [],
   };
 
@@ -369,6 +380,14 @@
     loans: {
       table: "#loanTable",
       headers: ["选择", "图书", "读者", "借出日期", "应还日期", "归还日期", "续借", "状态", "罚金", "操作"],
+    },
+    accounts: {
+      table: "#accountTable",
+      headers: ["用户名", "姓名", "角色", "状态", "最近登录", "创建时间", "操作"],
+    },
+    logs: {
+      table: "#logTable",
+      headers: ["时间", "操作者", "动作", "对象", "结果", "摘要"],
     },
   };
 
@@ -501,6 +520,16 @@
     } else if (view === "loans") {
       write(state.loans);
       if (state.loans.status && state.loans.status !== "all") params.set("st", state.loans.status);
+    } else if (view === "accounts") {
+      if (state.accounts.keyword) params.set("kw", state.accounts.keyword);
+    } else if (view === "logs") {
+      const s = state.logs;
+      if (s.keyword) params.set("kw", s.keyword);
+      if (s.page > 1) params.set("page", String(s.page));
+      if (s.pageSize !== 20) params.set("size", String(s.pageSize));
+      if (s.actorType) params.set("actor", s.actorType);
+      if (s.action) params.set("action", s.action);
+      if (s.status) params.set("st", s.status);
     }
     const qs = params.toString();
     return "#" + view + (qs ? "?" + qs : "");
@@ -533,6 +562,18 @@
       document.querySelectorAll("#loanTabs .tab").forEach((t) =>
         t.classList.toggle("is-active", t.dataset.status === state.loans.status)
       );
+    } else if (v === "accounts") {
+      const box = $("#accountKeyword");
+      if (box) box.value = state.accounts.keyword;
+    } else if (v === "logs") {
+      const kw = $("#logKeyword");
+      if (kw) kw.value = state.logs.keyword;
+      const actor = $("#logActorType");
+      if (actor) actor.value = state.logs.actorType;
+      const action = $("#logAction");
+      if (action) action.value = state.logs.action;
+      const status = $("#logStatus");
+      if (status) status.value = state.logs.status;
     }
   }
 
@@ -570,6 +611,17 @@
         pageSize: size,
         sort,
         order,
+      });
+    } else if (view === "accounts") {
+      Object.assign(state.accounts, { keyword: kw });
+    } else if (view === "logs") {
+      Object.assign(state.logs, {
+        keyword: kw,
+        page,
+        pageSize: positiveInt(params.get("size"), 20),
+        actorType: params.get("actor") || "",
+        action: params.get("action") || "",
+        status: params.get("st") || "",
       });
     }
     syncToolbar(view);
@@ -840,11 +892,11 @@
                 <td>${stock}</td>
                 <td><div class="actions">
                   <button class="btn sm" data-detail="${b.id}">详情</button>
-                  <button class="btn sm" data-edit="${b.id}">编辑</button>
+                  ${can("book:write") ? `<button class="btn sm" data-edit="${b.id}">编辑</button>
                   <button class="btn sm" data-label="${b.id}" title="打印馆藏条码标签">标签</button>
-                  <button class="btn sm" data-borrow="${b.id}" ${offShelf || avail === 0 ? "disabled" : ""} title="${offShelf ? "已下架，无法借出" : avail === 0 ? "当前无可借库存" : "为该图书办理借书"}">借出</button>
                   <button class="btn sm" data-shelf="${b.id}" data-off="${offShelf ? "0" : "1"}" data-title="${esc(b.title)}" title="${offShelf ? "恢复到架上，读者可检索与借阅" : "从读者门户移除，不可借出（需先还清在借册数）"}">${offShelf ? "上架" : "下架"}</button>
-                  <button class="btn sm danger" data-del="${b.id}" data-title="${esc(b.title)}">删除</button>
+                  <button class="btn sm danger" data-del="${b.id}" data-title="${esc(b.title)}">删除</button>` : ""}
+                  ${can("loan:write") ? `<button class="btn sm" data-borrow="${b.id}" ${offShelf || avail === 0 ? "disabled" : ""} title="${offShelf ? "已下架，无法借出" : avail === 0 ? "当前无可借库存" : "为该图书办理借书"}">借出</button>` : ""}
                 </div></td>
               </tr>`;
             })
@@ -988,8 +1040,8 @@
           </div>
           <div class="bd-actions">
             <button type="button" class="btn sm" data-print>打印条码标签</button>
-            <button type="button" class="btn sm" data-edit>编辑这本图书</button>
-            <button type="button" class="btn sm ${offShelf ? "" : "danger"}" data-shelf>${offShelf ? "重新上架" : "下架这本图书"}</button>
+            ${can("book:write") ? `<button type="button" class="btn sm" data-edit>编辑这本图书</button>
+            <button type="button" class="btn sm ${offShelf ? "" : "danger"}" data-shelf>${offShelf ? "重新上架" : "下架这本图书"}</button>` : ""}
           </div>`;
         openModal({
           title: `图书详情 · 《${b.title}》`,
@@ -1005,14 +1057,20 @@
                 openLabelDialog(b.id);
               });
             }
-            form.querySelector("[data-edit]").addEventListener("click", () => {
-              closeModal();
-              openBookForm(b.id);
-            });
-            form.querySelector("[data-shelf]").addEventListener("click", () => {
-              closeModal();
-              toggleShelf(b.id, !offShelf, b.title);
-            });
+            const editBtn = form.querySelector("[data-edit]");
+            if (editBtn) {
+              editBtn.addEventListener("click", () => {
+                closeModal();
+                openBookForm(b.id);
+              });
+            }
+            const shelfBtn = form.querySelector("[data-shelf]");
+            if (shelfBtn) {
+              shelfBtn.addEventListener("click", () => {
+                closeModal();
+                toggleShelf(b.id, !offShelf, b.title);
+              });
+            }
           },
         });
       })
@@ -1179,10 +1237,10 @@
                 <td><span class="badge ${frozen ? "warn" : "ok"}">${frozen ? "已冻结" : "正常"}</span></td>
                 <td>${Number(m.has_account) ? '<span class="badge neutral">已开通</span>' : '<span class="sub">未开通</span>'}</td>
                 <td><div class="actions">
-                  <button class="btn sm" data-edit="${m.id}">编辑</button>
+                  ${can("member:write") ? `<button class="btn sm" data-edit="${m.id}">编辑</button>` : ""}
                   <button class="btn sm" data-history="${m.id}" data-name="${esc(m.name)}" data-card="${esc(m.card_no)}">借阅记录</button>
-                  <button class="btn sm" data-resetpw="${m.id}" data-name="${esc(m.name)}" data-card="${esc(m.card_no)}">重置密码</button>
-                  <button class="btn sm danger" data-del="${m.id}" data-name="${esc(m.name)}" data-card="${esc(m.card_no)}">删除</button>
+                  ${can("member:write") ? `<button class="btn sm" data-resetpw="${m.id}" data-name="${esc(m.name)}" data-card="${esc(m.card_no)}">重置密码</button>
+                  <button class="btn sm danger" data-del="${m.id}" data-name="${esc(m.name)}" data-card="${esc(m.card_no)}">删除</button>` : ""}
                 </div></td>
               </tr>`;
             })
@@ -1371,7 +1429,7 @@
           <tbody>${payload.items
             .map((r) => {
               const open = r.status !== "returned";
-              const pick = open
+              const pick = open && can("loan:write")
                 ? `<input type="checkbox" class="loan-pick" value="${r.id}"
                           data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}"
                           data-card="${esc(r.member_card)}" data-due="${esc(fmtDate(r.due_at))}"
@@ -1390,10 +1448,10 @@
                   ? money(r.fine) + (r.fine_capped ? '<div class="sub">已封顶</div>' : "")
                   : '<span class="sub">—</span>'}</td>
                 <td><div class="actions">
-                  <button class="btn sm primary" data-return="${r.id}" ${open ? "" : "disabled"}
+                  ${can("loan:write") ? `<button class="btn sm primary" data-return="${r.id}" ${open ? "" : "disabled"}
                           data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}" data-card="${esc(r.member_card)}">还书</button>
                   <button class="btn sm" data-renew="${r.id}" ${r.can_renew ? "" : "disabled"}
-                          data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}" data-due="${esc(fmtDate(r.due_at))}">续借</button>
+                          data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}" data-due="${esc(fmtDate(r.due_at))}">续借</button>` : '<span class="sub">仅可查看</span>'}
                 </div></td>
               </tr>`;
             })
@@ -1959,15 +2017,40 @@
     const data = await api.request("/api/auth/me");
     auth.admin = data.admin;
     auth.csrf = data.csrf_token;
+    auth.permissions = data.permissions || [];
     const name = (auth.admin && (auth.admin.display_name || auth.admin.username)) || "管理员";
     $("#adminName").textContent = name;
-    $("#adminRole").textContent = auth.admin.role === "admin" ? "系统管理员" : "馆员";
+    auth.roleLabel =
+      data.role_label || (auth.admin.role === "admin" ? "系统管理员" : "流通馆员");
+    $("#adminRole").textContent = auth.roleLabel;
     $("#adminAvatar").textContent = name.slice(0, 1);
+    applyPermissions();
     renderSecurityBanner(data.security);
     renderPolicy(data.policy);
     // 会话到期提醒：闲置到临期前给出提示，避免弹窗里未保存的内容无声丢失
     sessionWatch.start(data.session && data.session.lifetime_seconds);
     return data;
+  }
+
+  /** 按当前角色收拢入口：无权的东西不显示，而不是"点了才报 403"。 */
+  function applyPermissions() {
+    document.querySelectorAll("[data-permission]").forEach((node) => {
+      const needed = node.dataset.permission;
+      const allowed = can(needed);
+      if (node.classList.contains("nav-item") || node.classList.contains("view")) {
+        node.hidden = !allowed;
+      } else if (node.disabled !== undefined) {
+        node.disabled = !allowed;
+        node.hidden = !allowed;
+      } else {
+        node.hidden = !allowed;
+      }
+    });
+    // 无权访问的视图不该停在页面上（例如刷新时 hash 还指着它）
+    const current = VIEWS[state.view];
+    if (current && current.permission && !can(current.permission)) {
+      state.view = "dashboard";
+    }
   }
 
   /* 默认口令提醒：只要管理员还在用初始口令，就一直挂在页面上，直到改掉为止 */
@@ -2017,6 +2100,7 @@
   /** 只切换界面并加载数据，不改 URL（URL 由 navigateTo / hashchange 统一负责）。 */
   function activateView(view) {
     if (!VIEWS[view]) view = "dashboard";
+    if (VIEWS[view].permission && !can(VIEWS[view].permission)) view = "dashboard";
     state.view = view;
     document.querySelectorAll(".nav-item").forEach((btn) =>
       btn.classList.toggle("is-active", btn.dataset.view === view)
@@ -2043,8 +2127,17 @@
   /** hash 变化的唯一入口：首次加载、导航点击、浏览器前进/后退都走这里。 */
   function onHashChange() {
     const { view, params } = readHash(location.hash);
-    const target = VIEWS[view] ? view : "dashboard";
-    if (target !== view) {
+    let target = VIEWS[view] ? view : "dashboard";
+    if (VIEWS[target].permission && !can(VIEWS[target].permission)) {
+      // 手改地址栏 / 旧书签指向无权视图：挡回概览，并把地址栏改干净
+      toast(
+        "没有访问权限",
+        `当前角色（${auth.roleLabel || "—"}）看不到「${VIEWS[target].title}」`,
+        "warn"
+      );
+      target = "dashboard";
+      history.replaceState(null, "", location.pathname + location.search + buildHash(target));
+    } else if (target !== view) {
       // 非法 hash 归一为默认视图，并把地址栏改干净（不再新增历史条目）
       history.replaceState(null, "", location.pathname + location.search + buildHash(target));
     } else {
@@ -2058,6 +2151,8 @@
     if (state.view === "books") return Promise.all([loadBooks(), loadCategories()]);
     if (state.view === "members") return loadMembers();
     if (state.view === "loans") return loadLoans();
+    if (state.view === "accounts") return loadAccounts();
+    if (state.view === "logs") return loadLogs();
   }
 
   async function loadDashboard() {
@@ -2145,6 +2240,294 @@
     });
   }
 
+  /* ---------------- 账号管理（仅系统管理员） ---------------- */
+
+  const ROLE_LABELS = { admin: "系统管理员", librarian: "流通馆员" };
+
+  function roleBadge(role) {
+    const label = ROLE_LABELS[role] || role || "—";
+    return `<span class="badge ${role === "admin" ? "info" : "neutral"}">${esc(label)}</span>`;
+  }
+
+  async function loadAccounts() {
+    const s = state.accounts;
+    await withViewLoading("accounts", async () => {
+      const payload = await api.get("/api/accounts");
+      renderAccounts(payload, s.keyword);
+    });
+  }
+
+  function renderAccounts(payload, keyword) {
+    const table = $("#accountTable");
+    const kw = String(keyword || "").trim().toLowerCase();
+    const items = (payload.items || []).filter((a) =>
+      kw
+        ? String(a.username || "").toLowerCase().includes(kw) ||
+          String(a.display_name || "").toLowerCase().includes(kw)
+        : true
+    );
+    if (!items.length) {
+      table.innerHTML = emptyState(7, kw ? "没有匹配的后台账号" : "还没有后台账号", kw ? "清除搜索" : "");
+      const clear = table.querySelector("[data-clear]");
+      if (clear) clear.addEventListener("click", resetAccounts);
+      return;
+    }
+    table.innerHTML = `<thead><tr>
+        <th>用户名</th><th>姓名</th><th>角色</th><th>状态</th><th>最近登录</th><th>创建时间</th><th>操作</th>
+      </tr></thead>
+      <tbody>${items
+        .map((a) => {
+          const self = auth.admin && Number(auth.admin.id) === Number(a.id);
+          return `<tr${a.is_active ? "" : ' class="is-inactive"'}>
+            <td class="title-cell"><strong class="mono">${esc(a.username)}</strong>${
+              self ? '<div class="sub">当前登录账号</div>' : ""
+            }</td>
+            <td>${esc(a.display_name || "—")}</td>
+            <td>${roleBadge(a.role)}</td>
+            <td>${
+              a.is_active
+                ? '<span class="badge ok">已启用</span>'
+                : '<span class="badge warn">已停用</span>'
+            }</td>
+            <td class="sub">${esc(a.last_login_at ? fmtDateTime(a.last_login_at) : "从未登录")}</td>
+            <td class="sub">${esc(fmtDate(a.created_at))}</td>
+            <td><div class="actions">
+              <button class="btn sm" data-edit="${a.id}">编辑</button>
+              <button class="btn sm" data-resetpw="${a.id}" data-username="${esc(a.username)}">重置密码</button>
+              <button class="btn sm danger" data-del="${a.id}" data-username="${esc(a.username)}"${
+                self ? ' disabled title="不能删除自己的账号"' : ""
+              }>删除</button>
+            </div></td>
+          </tr>`;
+        })
+        .join("")}</tbody>`;
+  }
+
+  function resetAccounts() {
+    state.accounts.keyword = "";
+    const box = $("#accountKeyword");
+    if (box) box.value = "";
+    syncUrl();
+    loadAccounts().catch(showError);
+  }
+
+  function openAccountForm(accountId) {
+    const isEdit = accountId !== null && accountId !== undefined;
+    const build = (account) => {
+      const roles =
+        state.accountRoles && state.accountRoles.length
+          ? state.accountRoles
+          : [
+              { value: "admin", label: "系统管理员" },
+              { value: "librarian", label: "流通馆员" },
+            ];
+      const isSelf = isEdit && auth.admin && Number(auth.admin.id) === Number(account.id);
+      const body = `
+        <div class="form-grid">
+          <div class="field full"><label>用户名<span class="req">*</span></label>
+            <input name="username" type="text" autocomplete="off" ${
+              isEdit ? "disabled" : ""
+            } value="${esc(account ? account.username : "")}" placeholder="3–32 位字母/数字/_ . @ -" />
+            <span class="tip">${
+              isEdit
+                ? "用户名是登录标识，创建后不可修改"
+                : "登录后台用的账号，不能与读者的借书证号或手机号重名"
+            }</span>
+          </div>
+          <div class="field full"><label>姓名</label>
+            <input name="display_name" type="text" value="${esc(account ? account.display_name : "")}" placeholder="留空则与用户名相同" />
+          </div>
+          <div class="field full"><label>角色<span class="req">*</span></label>
+            <select name="role" ${isSelf ? "disabled" : ""}>
+              ${roles
+                .map(
+                  (r) =>
+                    `<option value="${esc(r.value)}"${
+                      account && account.role === r.value ? " selected" : ""
+                    }>${esc(r.label)}</option>`
+                )
+                .join("")}
+            </select>
+            <span class="tip">系统管理员：全权，含账号管理与操作日志；流通馆员：图书编目、读者档案、借还续借，不能管理账号也看不到日志</span>
+            ${isSelf ? '<span class="tip is-warn">不能修改自己的角色，请让另一位系统管理员操作</span>' : ""}
+          </div>
+          ${
+            isEdit
+              ? `<div class="field full"><label class="check"><input type="checkbox" name="is_active" ${
+                  account.is_active ? "checked" : ""
+                } ${isSelf ? "disabled" : ""} /> 启用该账号（取消勾选即停用，停用后立即无法登录）</label></div>`
+              : `<div class="field full"><label>初始密码<span class="req">*</span></label>
+                  <input name="password" type="password" autocomplete="new-password" />
+                  <span class="tip">至少 6 位，创建后请通知本人登录并尽快自行修改</span>
+                </div>`
+          }
+        </div>`;
+      openModal({
+        title: isEdit ? `编辑账号 · ${account.username}` : "新建后台账号",
+        body,
+        confirmText: isEdit ? "保存修改" : "创建账号",
+        onSubmit: async (form) => {
+          if (isEdit) {
+            const patch = { display_name: form.display_name.value };
+            if (form.role && !form.role.disabled) patch.role = form.role.value;
+            if (form.is_active) patch.is_active = form.is_active.checked;
+            await api.put(`/api/accounts/${account.id}`, patch);
+            toast("账号已更新", `${account.username} 的信息已保存`, "ok");
+          } else {
+            const username = form.username.value.trim();
+            const password = form.password.value;
+            if (!username) {
+              throw new ApiError("请输入用户名", 400, "validation_error", "username");
+            }
+            if (!password || password.length < 6) {
+              throw new ApiError("初始密码至少 6 位", 400, "validation_error", "password");
+            }
+            const created = await api.post("/api/accounts", {
+              username,
+              password,
+              display_name: form.display_name.value,
+              role: form.role.value,
+            });
+            toast("账号已创建", `${created.username}（${created.role_label}）已可登录后台`, "ok");
+          }
+          await loadAccounts();
+        },
+      });
+    };
+
+    if (!isEdit) {
+      api
+        .get("/api/accounts")
+        .then((payload) => {
+          state.accountRoles = payload.roles || state.accountRoles;
+          build(null);
+        })
+        .catch(showError);
+      return;
+    }
+    api
+      .get(`/api/accounts/${accountId}`)
+      .then(build)
+      .catch(showError);
+  }
+
+  function openAccountPassword(accountId, username) {
+    openModal({
+      title: `重置密码 · ${username}`,
+      body: `
+        <div class="form-grid">
+          <div class="field full"><label>新密码<span class="req">*</span></label>
+            <input name="password" type="password" autocomplete="new-password" />
+            <span class="tip">至少 6 位。重置不会让该账号已登录的会话立即失效，若怀疑账号被盗用请同时停用它。</span>
+          </div>
+        </div>`,
+      confirmText: "确认重置",
+      onSubmit: async (form) => {
+        const password = form.password.value;
+        if (!password || password.length < 6) {
+          throw new ApiError("新密码至少 6 位", 400, "validation_error", "password");
+        }
+        await api.post(`/api/accounts/${accountId}/password`, { password });
+        toast("密码已重置", `${username} 可使用新密码登录`, "ok");
+      },
+    });
+  }
+
+  function confirmDeleteAccount(accountId, username) {
+    openModal({
+      title: "删除后台账号",
+      body: `<p>确定删除账号「<b>${esc(username)}</b>」吗？该账号将立即无法登录；<b>历史操作日志会保留</b>，仍可追溯它做过的操作。</p>`,
+      confirmText: "删除账号",
+      danger: true,
+      onSubmit: async () => {
+        await api.del(`/api/accounts/${accountId}`);
+        toast("账号已删除", `${username} 已无法登录后台`, "ok");
+        await loadAccounts();
+      },
+    });
+  }
+
+  /* ---------------- 操作日志（仅系统管理员） ---------------- */
+
+  async function loadLogs() {
+    const s = state.logs;
+    await withViewLoading("logs", async () => {
+      const payload = await api.get("/api/logs", {
+        page: s.page,
+        page_size: s.pageSize,
+        keyword: s.keyword,
+        actor_type: s.actorType,
+        action: s.action,
+        status: s.status,
+      });
+      renderLogs(payload);
+    });
+  }
+
+  function renderLogs(payload) {
+    const table = $("#logTable");
+    const actionSelect = $("#logAction");
+    // 动作下拉只需填一次（选项来自后端动作表，避免前后端两处维护）
+    if (actionSelect && actionSelect.options.length <= 1 && (payload.actions || []).length) {
+      actionSelect.innerHTML =
+        `<option value="">全部动作</option>` +
+        payload.actions
+          .map((a) => `<option value="${esc(a.value)}">${esc(a.label)}</option>`)
+          .join("");
+      actionSelect.value = state.logs.action;
+    }
+    const hint = $("#logHint");
+    if (hint) hint.textContent = payload.total ? `共 ${payload.total} 条记录` : "";
+
+    const items = payload.items || [];
+    if (!items.length) {
+      table.innerHTML = emptyState(6, "没有匹配的操作记录", "清除筛选");
+      const clear = table.querySelector("[data-clear]");
+      if (clear) clear.addEventListener("click", resetLogs);
+      return;
+    }
+
+    table.innerHTML = `<thead><tr>
+        <th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th>结果</th><th class="wrap">摘要</th>
+      </tr></thead>
+      <tbody>${items
+        .map((l) => {
+          const denied = l.status === "denied";
+          const target = l.entity_label || l.entity || "—";
+          const targetText = l.entity_id ? `${target} #${esc(l.entity_id)}` : target;
+          const actorSub = [l.actor_type_label, l.actor_role && l.actor_role !== l.actor_type ? l.actor_role : ""]
+            .filter(Boolean)
+            .join(" · ");
+          return `<tr${denied ? ' class="is-inactive"' : ""}>
+            <td class="sub">${esc(fmtDateTime(l.created_at))}</td>
+            <td>${esc(l.actor_display || "—")}<div class="sub">${esc(actorSub)}</div></td>
+            <td>${esc(l.action_label || l.action)}<div class="sub mono">${esc(l.action)}</div></td>
+            <td>${esc(targetText)}</td>
+            <td>${
+              denied ? '<span class="badge danger">已拦截</span>' : '<span class="badge ok">已执行</span>'
+            }</td>
+            <td class="wrap">${esc(l.summary)}</td>
+          </tr>`;
+        })
+        .join("")}</tbody>`;
+
+    renderPager($("#logPager"), payload, (patch) => updateFilters(patch));
+  }
+
+  function resetLogs() {
+    state.logs = {
+      page: 1,
+      pageSize: state.logs.pageSize,
+      keyword: "",
+      actorType: "",
+      action: "",
+      status: "",
+    };
+    syncToolbar("logs");
+    syncUrl();
+    loadLogs().catch(showError);
+  }
+
   /* ---------------- 事件绑定 ---------------- */
 
   function bindEvents() {
@@ -2223,6 +2606,70 @@
       });
     });
     $("#changePwdBtn").addEventListener("click", openChangePassword);
+
+    // 账号管理（仅系统管理员可见；事件委托绑在表格上，重渲染不丢监听）
+    const accountKw = $("#accountKeyword");
+    if (accountKw) {
+      accountKw.addEventListener(
+        "input",
+        debounce((e) => {
+          state.accounts.keyword = e.target.value.trim();
+          syncUrl();
+          loadAccounts().catch(showError);
+        }, 300)
+      );
+    }
+    const accountResetBtn = $("#accountReset");
+    if (accountResetBtn) accountResetBtn.addEventListener("click", resetAccounts);
+    const accountCreateBtn = $("#accountCreate");
+    if (accountCreateBtn) accountCreateBtn.addEventListener("click", () => openAccountForm(null));
+    const accountTable = $("#accountTable");
+    if (accountTable) {
+      accountTable.addEventListener("click", (e) => {
+        const edit = e.target.closest("[data-edit]");
+        if (edit) {
+          openAccountForm(Number(edit.dataset.edit));
+          return;
+        }
+        const reset = e.target.closest("[data-resetpw]");
+        if (reset) {
+          openAccountPassword(Number(reset.dataset.resetpw), reset.dataset.username);
+          return;
+        }
+        const del = e.target.closest("[data-del]");
+        if (del && !del.disabled) {
+          confirmDeleteAccount(Number(del.dataset.del), del.dataset.username);
+        }
+      });
+    }
+
+    // 操作日志
+    const logKw = $("#logKeyword");
+    if (logKw) {
+      logKw.addEventListener(
+        "input",
+        debounce((e) => {
+          state.logs.keyword = e.target.value.trim();
+          state.logs.page = 1;
+          syncUrl();
+          loadLogs().catch(showError);
+        }, 300)
+      );
+    }
+    [["#logActorType", "actorType"], ["#logAction", "action"], ["#logStatus", "status"]].forEach(
+      ([selector, key]) => {
+        const node = $(selector);
+        if (!node) return;
+        node.addEventListener("change", (e) => {
+          state.logs[key] = e.target.value;
+          state.logs.page = 1;
+          syncUrl();
+          loadLogs().catch(showError);
+        });
+      }
+    );
+    const logResetBtn = $("#logReset");
+    if (logResetBtn) logResetBtn.addEventListener("click", resetLogs);
     const bannerBtn = $("#securityBannerBtn");
     if (bannerBtn) bannerBtn.addEventListener("click", openChangePassword);
     const sessionBtn = $("#sessionBannerBtn");

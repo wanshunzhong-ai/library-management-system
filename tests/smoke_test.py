@@ -1590,6 +1590,212 @@ def main() -> int:
     check("保持登录 / 重新登录出口齐备", '"keepalive"' in js2 and '"relogin"' in js2)
     check("加载会话后启动到期监视", "sessionWatch.start(" in js2)
 
+    print("\n=== 29. 后台账号、角色权限与操作日志 ===")
+
+    # ---- 29.1 账号管理：新建 / 列表 / 校验 ----
+    r = api.post("/api/accounts", json={
+        "username": "lib1", "password": "lib12345",
+        "display_name": "流通馆员小李", "role": "librarian",
+    })
+    check("新建流通馆员账号返回 201", r.status_code == 201, (r.status_code, r.get_json()))
+    lib_account = r.get_json() or {}
+    lib_id = lib_account.get("id")
+    check("账号回带角色中文名", lib_account.get("role_label") == "流通馆员", lib_account.get("role_label"))
+    check("账号响应不含口令散列", "password_hash" not in lib_account, list(lib_account.keys()))
+    lib_perms = set(lib_account.get("permissions") or [])
+    check(
+        "流通馆员不含账号管理与日志权限",
+        "account:manage" not in lib_perms and "log:read" not in lib_perms,
+        sorted(lib_perms),
+    )
+    check(
+        "流通馆员含业务写入权限",
+        {"book:write", "member:write", "loan:write"} <= lib_perms,
+        sorted(lib_perms),
+    )
+
+    r = api.get("/api/accounts")
+    acc_body = r.get_json() or {}
+    check("账号列表可读取", r.status_code == 200 and acc_body.get("total", 0) >= 2, acc_body.get("total"))
+    check("账号列表不含口令散列", all("password_hash" not in item for item in acc_body.get("items", [])))
+    check("账号列表附带角色选项", any(o["value"] == "admin" for o in acc_body.get("roles", [])))
+
+    r = api.get(f"/api/accounts/{lib_id}")
+    check("单个账号可读取", r.status_code == 200 and r.get_json().get("username") == "lib1", r.status_code)
+
+    check(
+        "用户名重复返回 409",
+        api.post("/api/accounts", json={"username": "lib1", "password": "lib12345", "role": "librarian"}).status_code == 409,
+    )
+    taken_card = page_items("/api/members")[0]["card_no"]
+    check(
+        "用户名与读者证号重名返回 409",
+        api.post("/api/accounts", json={"username": taken_card, "password": "lib12345", "role": "librarian"}).status_code == 409,
+        taken_card,
+    )
+    check(
+        "非法用户名格式返回 400",
+        api.post("/api/accounts", json={"username": "bad role", "password": "lib12345", "role": "librarian"}).status_code == 400,
+    )
+    check(
+        "密码过短返回 400",
+        api.post("/api/accounts", json={"username": "lib2", "password": "123", "role": "librarian"}).status_code == 400,
+    )
+    check(
+        "非法角色返回 400",
+        api.post("/api/accounts", json={"username": "lib2", "password": "lib12345", "role": "root"}).status_code == 400,
+    )
+
+    # ---- 29.2 角色权限：馆员能做业务，但碰不到账号与日志 ----
+    lib_client = app.test_client()
+    lib_api = Api(lib_client)
+    r = lib_client.post("/api/auth/login", json={"username": "lib1", "password": "lib12345"})
+    check("流通馆员可登录后台", r.status_code == 200 and r.get_json().get("role") == "admin", (r.status_code, r.get_json()))
+    lib_api.csrf = (r.get_json() or {}).get("csrf_token")
+    check("会话回带角色中文名", lib_client.get("/api/auth/me").get_json().get("role_label") == "流通馆员")
+
+    check("馆员可读图书列表（读不受限）", lib_client.get("/api/books").status_code == 200)
+    check("馆员可读读者列表", lib_client.get("/api/members").status_code == 200)
+    check("馆员可读概览报表", lib_client.get("/api/dashboard/overview").status_code == 200)
+
+    r = lib_api.post("/api/books", json={"isbn": "9780000000999", "title": "馆员编目测试书", "total_copies": 1})
+    check("馆员可新增图书（book:write）", r.status_code == 201, (r.status_code, r.get_json()))
+    lib_book_id = (r.get_json() or {}).get("id")
+    check("馆员可删除图书", lib_api.delete(f"/api/books/{lib_book_id}").status_code == 200)
+
+    r = lib_client.get("/api/accounts")
+    check("馆员读账号列表被拒 403", r.status_code == 403, (r.status_code, r.get_json()))
+    check("403 提示说明缺少哪项权限", "权限" in (r.get_json() or {}).get("error", {}).get("message", ""), r.get_json())
+    r = lib_api.post("/api/accounts", json={"username": "hack", "password": "hack12345", "role": "admin"})
+    check("馆员建账号被拒 403", r.status_code == 403, (r.status_code, r.get_json()))
+    check("馆员读操作日志被拒 403", lib_client.get("/api/logs").status_code == 403)
+    check("馆员删账号被拒 403", lib_api.delete(f"/api/accounts/{lib_id}").status_code == 403)
+
+    # ---- 29.3 审计留痕：业务操作与越权尝试都进日志 ----
+    r = api.get("/api/logs", query_string={"page_size": 50, "action": "permission.denied"})
+    denied = r.get_json() or {}
+    check("越权尝试被记入日志", r.status_code == 200 and denied.get("total", 0) >= 2, denied.get("total"))
+    denied_items = denied.get("items") or []
+    if denied_items:
+        check("越权日志标记为已拦截", denied_items[0]["status"] == "denied", denied_items[0].get("status"))
+        check("越权日志记录了操作者姓名", denied_items[0]["actor_name"] == "流通馆员小李", denied_items[0].get("actor_name"))
+        check("越权日志带动作中文名", denied_items[0]["action_label"] == "权限不足（已拦截）", denied_items[0].get("action_label"))
+
+    r = api.get("/api/logs", query_string={"page_size": 20})
+    logs = r.get_json() or {}
+    check("操作日志可分页读取", r.status_code == 200 and logs.get("total", 0) > 0, logs.get("total"))
+    visible = logs.get("items") or []
+    check("日志按时间倒序（id 递减）", len(visible) < 2 or visible[0]["id"] > visible[-1]["id"])
+    check("日志带操作者类型中文名", bool(visible) and bool(visible[0].get("actor_type_label")), visible[:1])
+
+    r = api.get("/api/logs", query_string={"page_size": 50, "action": "book.create"})
+    created = r.get_json() or {}
+    check("新增图书已留痕", created.get("total", 0) >= 1, created.get("total"))
+    created_items = created.get("items") or []
+    if created_items:
+        check("日志摘要含具体对象（书名）", "《" in created_items[0]["summary"], created_items[0].get("summary"))
+
+    # 同一动作由不同角色做出时，日志要能区分到人（含角色）——这是分权可追责的前提
+    mine = api.get("/api/logs", query_string={
+        "page_size": 20, "action": "book.create", "keyword": "馆员编目测试书",
+    }).get_json() or {}
+    check(
+        "馆员自己的操作留痕且角色标注为 librarian",
+        mine.get("total", 0) >= 1 and (mine.get("items") or [{}])[0].get("actor_role") == "librarian",
+        [i.get("actor_role") for i in (mine.get("items") or [])][:3],
+    )
+    admins = api.get("/api/logs", query_string={
+        "page_size": 20, "action": "book.create", "keyword": "校验位提示测试书",
+    }).get_json() or {}
+    check(
+        "管理员的同类操作标注为 admin",
+        admins.get("total", 0) >= 1 and (admins.get("items") or [{}])[0].get("actor_role") == "admin",
+        [i.get("actor_role") for i in (admins.get("items") or [])][:3],
+    )
+    check(
+        "日志支持关键词搜索",
+        api.get("/api/logs", query_string={"page_size": 10, "keyword": "已拦截"}).get_json().get("total", 0) >= 1,
+    )
+    check("日志概览可读取", api.get("/api/logs/overview").status_code == 200)
+
+    # ---- 29.4 自锁防护与「最后一个管理员」纵深防御 ----
+    admin_id = api.get("/api/auth/me").get_json()["admin"]["id"]
+    r = api.put(f"/api/accounts/{lib_id}", json={"is_active": False})
+    check("停用普通账号成功", r.status_code == 200 and r.get_json().get("is_active") is False, (r.status_code, r.get_json()))
+    check("停用后该账号会话立即失效（401）", lib_client.get("/api/auth/me").status_code == 401)
+    check("停用后无法再登录", lib_client.post("/api/auth/login", json={"username": "lib1", "password": "lib12345"}).status_code != 200)
+
+    check(
+        "不能停用自己的账号（422）",
+        api.put(f"/api/accounts/{admin_id}", json={"is_active": False}).status_code == 422,
+    )
+    check(
+        "不能修改自己的角色（422）",
+        api.put(f"/api/accounts/{admin_id}", json={"role": "librarian"}).status_code == 422,
+    )
+    check("不能删除自己的账号（422）", api.delete(f"/api/accounts/{admin_id}").status_code == 422)
+
+    # 「最后一个在职管理员」是自锁防护之外的纵深防御：即便绕过"不能操作自己"
+    # （例如脚本里 actor_id 传空），也不允许把系统改到没人能管后台的状态。
+    from library.accounts import service as accounts_service  # 局部导入
+    from library.errors import BusinessRuleError  # 局部导入
+
+    with app.app_context():
+        try:
+            accounts_service.delete_account(admin_id, actor_id=None)
+            last_admin_blocked = False
+        except BusinessRuleError as exc:
+            last_admin_blocked = "最后一个" in str(exc)
+    check("最后一个在职管理员不可被删除（纵深防御）", last_admin_blocked)
+
+    # ---- 29.5 重新启用 / 重置密码 / 删除 ----
+    r = api.put(f"/api/accounts/{lib_id}", json={
+        "is_active": True, "role": "librarian", "display_name": "流通馆员小李",
+    })
+    check("重新启用账号成功", r.status_code == 200 and r.get_json().get("is_active") is True, (r.status_code, r.get_json()))
+    check(
+        "重新启用后可再次登录",
+        lib_client.post("/api/auth/login", json={"username": "lib1", "password": "lib12345"}).status_code == 200,
+    )
+
+    r = api.post(f"/api/accounts/{lib_id}/password", json={"password": "newlib12345"})
+    check("重置后台账号密码成功", r.status_code == 200, (r.status_code, r.get_json()))
+    check(
+        "旧密码失效",
+        lib_client.post("/api/auth/login", json={"username": "lib1", "password": "lib12345"}).status_code == 401,
+    )
+    check(
+        "新密码可登录",
+        lib_client.post("/api/auth/login", json={"username": "lib1", "password": "newlib12345"}).status_code == 200,
+    )
+
+    r = api.delete(f"/api/accounts/{lib_id}")
+    check("删除账号成功", r.status_code == 200, (r.status_code, r.get_json()))
+    check("删除后账号不存在（404）", api.get(f"/api/accounts/{lib_id}").status_code == 404)
+
+    # ---- 29.6 未登录一律拦在门外 ----
+    anon = app.test_client()
+    check("未登录读账号列表 401", anon.get("/api/accounts").status_code == 401)
+    check("未登录读操作日志 401", anon.get("/api/logs").status_code == 401)
+    check("未登录建账号 401", anon.post("/api/accounts", json={"username": "x", "password": "xxxxxx", "role": "admin"}).status_code == 401)
+
+    print("\n=== 29B. 前端资源契约（角色入口 / 账号管理 / 操作日志） ===")
+    html_role = (root2 / "templates" / "index.html").read_text(encoding="utf-8")
+    js_role = (root2 / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    css_role = (root2 / "static" / "css" / "app.css").read_text(encoding="utf-8")
+    check("导航含账号管理入口", 'data-view="accounts"' in html_role and 'data-permission="account:manage"' in html_role)
+    check("导航含操作日志入口", 'data-view="logs"' in html_role and 'data-permission="log:read"' in html_role)
+    check("无权入口默认隐藏（避免点进去才被拒）", 'data-permission="account:manage" hidden' in html_role)
+    check("前端按权限收拢入口", "applyPermissions" in js_role and "function can(" in js_role)
+    check("越权视图回落概览", "VIEWS[target].permission" in js_role and "VIEWS[view].permission" in js_role)
+    check("账号管理调用账号接口", "/api/accounts" in js_role)
+    check("操作日志调用日志接口", "/api/logs" in js_role)
+    check(
+        "行内写操作按钮按权限渲染",
+        'can("book:write")' in js_role and 'can("member:write")' in js_role and 'can("loan:write")' in js_role,
+    )
+    check("停用账号 / 拦截记录有降噪样式", "is-inactive" in css_role and "is-inactive" in js_role)
+
     print(f"\n{'=' * 46}\n结果：{PASSED} 项通过，{FAILED} 项失败\n{'=' * 46}")
     return 0 if FAILED == 0 else 1
 

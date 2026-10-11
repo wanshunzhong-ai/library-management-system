@@ -21,6 +21,9 @@
         <button class="nav-item" data-view="books"><span class="nav-ico">▤</span>图书管理</button>
         <button class="nav-item" data-view="members"><span class="nav-ico">◍</span>读者管理</button>
         <button class="nav-item" data-view="loans"><span class="nav-ico">⇄</span>借阅管理</button>
+        <!-- 系统管理：仅系统管理员可见（角色不足时保持 hidden，避免"点进去被拒"） -->
+        <button class="nav-item" data-view="accounts" data-permission="account:manage" hidden><span class="nav-ico">⚙</span>账号管理</button>
+        <button class="nav-item" data-view="logs" data-permission="log:read" hidden><span class="nav-ico">≡</span>操作日志</button>
       </nav>
       <div class="sidebar-foot" id="policyBox">
         <div class="policy-row"><span>借期</span><b id="policyDays">—</b></div>
@@ -152,6 +155,46 @@
         <div class="card">
           <div class="table-scroll"><table class="table" id="loanTable"></table></div>
           <div class="pager" id="loanPager"></div>
+        </div>
+      </section>
+      <section class="view" id="view-accounts" data-permission="account:manage">
+        <div class="toolbar">
+          <div class="search">
+            <input id="accountKeyword" type="search" placeholder="搜索用户名 / 姓名" />
+          </div>
+          <button class="btn ghost" id="accountReset">重置</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="accountCreate">+ 新建后台账号</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="accountTable"></table></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-logs" data-permission="log:read">
+        <div class="toolbar">
+          <div class="search">
+            <input id="logKeyword" type="search" placeholder="搜索摘要 / 动作 / 操作者 / 记录号" />
+          </div>
+          <select id="logActorType" class="select">
+            <option value="">全部操作者</option>
+            <option value="admin">后台账号</option>
+            <option value="reader">读者</option>
+            <option value="system">系统</option>
+          </select>
+          <select id="logAction" class="select"></select>
+          <select id="logStatus" class="select">
+            <option value="">全部结果</option>
+            <option value="ok">已执行</option>
+            <option value="denied">已拦截</option>
+          </select>
+          <button class="btn ghost" id="logReset">重置</button>
+          <div class="spacer"></div>
+          <span class="hint" id="logHint"></span>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="logTable"></table></div>
+          <div class="pager" id="logPager"></div>
         </div>
       </section>
     </main>

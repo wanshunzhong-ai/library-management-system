@@ -83,6 +83,7 @@ def _warn_if_default_admin_password() -> None:
 
 
 def _register_blueprints(app: Flask) -> None:
+    from library.accounts import bp as accounts_bp
     from library.auth import bp as auth_bp
     from library.books import bp as books_bp
     from library.dashboard import bp as dashboard_bp
@@ -98,6 +99,7 @@ def _register_blueprints(app: Flask) -> None:
     app.register_blueprint(members_bp)
     app.register_blueprint(loans_bp)
     app.register_blueprint(dashboard_bp)
+    app.register_blueprint(accounts_bp)
 
 
 def _register_guard(app: Flask) -> None:

@@ -244,6 +244,14 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .table tbody tr.is-off-shelf td { background: #fafbfd; color: var(--text-soft); }
 .table tbody tr.is-off-shelf .title-cell strong { color: var(--text-soft); }
 .table tbody tr.is-off-shelf:hover td { background: #f6f8fb; }
+
+/* 停用账号 / 被拦截的越权尝试：整行降噪但不隐藏——审计信息必须一直看得见 */
+.table tbody tr.is-inactive td { background: #fafbfd; color: var(--text-soft); }
+.table tbody tr.is-inactive:hover td { background: #f6f8fb; color: var(--text); }
+
+/* 操作日志：动作代码与用户名用等宽字体，便于对号入座 */
+.table td .mono, .table .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.log-role-tip { color: var(--muted); }
 .empty { padding: 34px 16px; text-align: center; color: var(--muted); }
 .empty .btn { margin-top: 10px; }
 /* 骨架行：首次进入视图时占位，避免内容跳变 */

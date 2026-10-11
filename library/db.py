@@ -73,6 +73,25 @@ CREATE TABLE IF NOT EXISTS admins (
     created_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+-- 操作日志：谁在什么时候改了什么。分权的前提是能追责，否则拆权限等于拆掉问责能力。
+-- 只记「谁 + 做了什么 + 打到哪条记录」，不记业务字段快照（避免把读者联系方式等
+-- 个人信息复制成第二份、扩大泄露面）。
+CREATE TABLE IF NOT EXISTS operation_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_type TEXT    NOT NULL DEFAULT 'system',   -- admin / reader / system
+    actor_id   INTEGER,
+    actor_name TEXT    NOT NULL DEFAULT '',
+    actor_role TEXT    NOT NULL DEFAULT '',
+    action     TEXT    NOT NULL,                    -- 例如 book.update / account.disable
+    entity     TEXT    NOT NULL DEFAULT '',         -- book / member / loan / account
+    entity_id  TEXT    NOT NULL DEFAULT '',
+    summary    TEXT    NOT NULL DEFAULT '',         -- 人类可读的一句话
+    detail     TEXT    NOT NULL DEFAULT '',         -- 结构化补充（JSON），已截断
+    status     TEXT    NOT NULL DEFAULT 'ok',       -- ok / denied
+    ip         TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_books_title      ON books(title);
 CREATE INDEX IF NOT EXISTS idx_books_category   ON books(category);
 CREATE INDEX IF NOT EXISTS idx_books_author     ON books(author);
@@ -82,6 +101,10 @@ CREATE INDEX IF NOT EXISTS idx_members_phone    ON members(phone);
 CREATE INDEX IF NOT EXISTS idx_loans_book       ON loans(book_id);
 CREATE INDEX IF NOT EXISTS idx_loans_member     ON loans(member_id);
 CREATE INDEX IF NOT EXISTS idx_loans_open       ON loans(returned_at, due_at);
+CREATE INDEX IF NOT EXISTS idx_logs_created     ON operation_logs(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_actor       ON operation_logs(actor_type, actor_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_entity      ON operation_logs(entity, entity_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_action      ON operation_logs(action, id DESC);
 """
 
 
