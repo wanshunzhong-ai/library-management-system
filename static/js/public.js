@@ -350,7 +350,41 @@
     }
   }
 
-  /* ---------------- 统一登录 ---------------- */
+  /* ---------------- 统一登录（右上角入口弹窗） ---------------- */
+
+  let loginTrigger = null;
+
+  function openLoginModal() {
+    loginTrigger = document.activeElement;
+    $("#loginModal").hidden = false;
+    loginError("");
+    $("#portalIdentifier").focus();
+  }
+
+  function closeLoginModal() {
+    $("#loginModal").hidden = true;
+    const fallback = $("#headerLoginBtn");
+    const target =
+      loginTrigger && loginTrigger !== document.body && loginTrigger.focus ? loginTrigger : fallback;
+    if (target && target.focus) target.focus();
+  }
+
+  /** 登录弹窗的 Tab 焦点陷阱：焦点只在弹窗内循环 */
+  function trapLoginTab(event) {
+    const focusables = Array.from(
+      $("#loginModal").querySelectorAll("button, input, a[href]")
+    ).filter((el) => !el.disabled && el.offsetParent !== null);
+    if (!focusables.length) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   function loginError(message, field) {
     const box = $("#portalLoginError");
@@ -471,8 +505,32 @@
       if (e.target === $("#bookModal")) closeBookModal();
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !$("#bookModal").hidden) closeBookModal();
+      if (e.key !== "Escape") return;
+      if (!$("#bookModal").hidden) closeBookModal();
+      else if (!$("#loginModal").hidden) closeLoginModal();
     });
+
+    // 登录弹窗：右上角按钮 / 页面内「前往登录」「登录入口」均可打开
+    $("#headerLoginBtn").addEventListener("click", openLoginModal);
+    document.querySelectorAll("[data-open-login]").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        openLoginModal();
+      });
+    });
+    $("#loginModalClose").addEventListener("click", closeLoginModal);
+    $("#loginModal").addEventListener("click", (e) => {
+      if (e.target === $("#loginModal")) closeLoginModal();
+    });
+    $("#loginModal").addEventListener("keydown", (e) => {
+      if (e.key === "Tab") trapLoginTab(e);
+    });
+
+    // 直链 #login（如旧链接 / 刷新后）也走弹窗，并清掉无效锚点
+    if (location.hash === "#login") {
+      history.replaceState(null, "", location.pathname + location.search);
+      openLoginModal();
+    }
   }
 
   document.addEventListener("DOMContentLoaded", () => {

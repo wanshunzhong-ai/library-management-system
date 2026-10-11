@@ -18,13 +18,21 @@ MEMBERS = [
     ("2024003", "张浩然", "13800003333", "zhanghaoran@example.com", "学生"),
     ("2024004", "陈雨欣", "13800004444", "chenyuxin@example.com", "学生"),
     ("2024005", "刘子墨", "13800005555", "liuzimo@example.com", "学生"),
+    ("2024006", "沈知言", "13800006666", "shenzhiyan@example.com", "学生"),
+    ("2024007", "苏婉清", "13800007777", "suwanqing@example.com", "学生"),
+    ("2024008", "顾青山", "13800008888", "guqingshan@example.com", "学生"),
+    ("2024009", "韩雪松", "13800009999", "hanxuesong@example.com", "学生"),
+    ("2024010", "林晚秋", "13800001011", "linwanqiu@example.com", "学生"),
     ("T202001", "赵启明", "13900006666", "zhaoqiming@example.com", "教师"),
     ("T202002", "孙丽华", "13900007777", "sunlihua@example.com", "教师"),
     ("T202003", "周建国", "13900008888", "zhoujianguo@example.com", "教师"),
+    ("T202004", "马文韬", "13900001012", "mawentao@example.com", "教师"),
     ("S2023001", "吴晓蓉", "13700009999", "wuxiaorong@example.com", "社会"),
     ("S2023002", "郑一鸣", "13700001010", "zhengyiming@example.com", "社会"),
+    ("S2023003", "方雨桐", "13700001314", "fangyutong@example.com", "社会"),
     ("V2025001", "黄嘉怡", "13600001122", "huangjiayi@example.com", "VIP"),
     ("V2025002", "何俊杰", "13600003344", "hejunjie@example.com", "VIP"),
+    ("V2025003", "秦朗", "13600001516", "qinlang@example.com", "VIP"),
 ]
 
 
@@ -79,17 +87,17 @@ def seed(force: bool = False) -> bool:
             )
             member_ids.append(int(cur.lastrowid))
 
-        # 构造借阅历史：约 45 条，覆盖「已归还 / 在借 / 逾期」三种状态
+        # 构造借阅历史：约 85 条，覆盖「已归还 / 在借 / 逾期」三种状态
         open_counter: dict[int, int] = {}
         # 同一读者不能同时借同一本书两次（业务规则 + 唯一索引都禁止），生成时先避开
         open_pairs: set[tuple[int, int]] = set()
         plans: list[tuple[int, int, int, int | None]] = []
-        for _ in range(45):
+        for _ in range(85):
             book_id, total = rng.choice(book_ids)
             if open_counter.get(book_id, 0) >= total:
                 continue
             member_id = rng.choice(member_ids)
-            borrowed_days_ago = rng.randint(1, 120)
+            borrowed_days_ago = rng.randint(1, 150)
             returned_after = None if rng.random() < 0.42 else rng.randint(1, min(30, borrowed_days_ago))
             if returned_after is None:
                 if (book_id, member_id) in open_pairs:

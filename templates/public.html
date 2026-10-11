@@ -25,9 +25,10 @@
         <a href="#rules">借阅规则</a>
         <a href="#about">关于本馆</a>
       </nav>
-      <a class="btn btn-primary header-login" href="#login">
+      <!-- 全站唯一登录入口：右上角按钮，点击弹出登录框 -->
+      <button class="btn btn-primary header-login" id="headerLoginBtn" type="button">
         <span class="lock">🔐</span> 登录
-      </a>
+      </button>
     </div>
   </header>
 
@@ -38,7 +39,7 @@
         <h1 class="hero-title">找一本书，从这里开始</h1>
         <p class="hero-sub">
           输入书名、作者、ISBN 或馆藏条码，即可查询这本书是否在馆、还剩几册可借、在哪个书架；
-          通过登录框登录后，读者进入「我的借阅」，馆员进入后台控制台。
+          点击右上角「登录」后，读者进入「我的借阅」，馆员进入后台控制台。
         </p>
 
         <form class="searchbar" id="searchForm" autocomplete="off">
@@ -55,45 +56,9 @@
 
         <ul class="hero-points">
           <li><b>免登录检索</b>馆藏与在架状态随时可查</li>
-          <li><b>读者登录</b>凭借书证号查看在借、自助续借</li>
-          <li><b>馆员登录</b>凭工作账号进入后台办理借还</li>
+          <li><b>右上角登录</b>读者看在借续借，馆员进后台</li>
         </ul>
       </div>
-
-      <aside class="hero-login">
-        <div class="login-panel" id="login">
-          <div class="lp-head">
-            <h2>登录</h2>
-            <p>读者用借书证号 / 手机号，馆员用工作账号</p>
-          </div>
-
-          <form id="portalLoginForm" novalidate>
-            <div class="field" id="plFieldAccount">
-              <label for="portalIdentifier">账号</label>
-              <input id="portalIdentifier" name="identifier" type="text" autocomplete="username"
-                     placeholder="借书证号 / 手机号 / 工作账号" />
-            </div>
-
-            <div class="field" id="plFieldPassword">
-              <label for="portalPassword">密码</label>
-              <div class="pw-wrap">
-                <input id="portalPassword" name="password" type="password" autocomplete="current-password"
-                       placeholder="请输入密码" />
-                <button type="button" class="pw-toggle" id="portalPwToggle" aria-label="显示密码">显示</button>
-              </div>
-            </div>
-
-            <div class="login-error" id="portalLoginError" hidden></div>
-
-            <button class="btn btn-primary btn-block" type="submit" id="portalLoginBtn">登录</button>
-          </form>
-
-          <div class="login-hint">
-            <b>读者</b>请使用借书证号或手机号登录，初始密码由馆员告知，登录后可在「我的借阅」里自行修改；
-            <b>馆员</b>使用后台工作账号。登录后系统自动识别身份并进入对应工作台。
-          </div>
-        </div>
-      </aside>
     </div>
   </section>
 
@@ -170,7 +135,7 @@
           <li>图书污损或遗失，需按规定赔偿。</li>
         </ol>
         <div class="about-actions">
-          <a class="btn btn-primary" href="#login">前往登录</a>
+          <a class="btn btn-primary" href="#login" data-open-login>前往登录</a>
         </div>
       </div>
     </div>
@@ -182,7 +147,7 @@
       <span class="dot">·</span>
       <span>馆藏检索系统</span>
       <span class="footer-spacer"></span>
-      <a href="#login">登录入口</a>
+      <a href="#login" data-open-login>登录入口</a>
     </div>
   </footer>
 
@@ -195,6 +160,45 @@
         <button class="bk-modal-close" id="bookModalClose" aria-label="关闭">✕</button>
       </div>
       <div class="bk-modal-body" id="bookModalBody"></div>
+    </div>
+  </div>
+
+  <!-- 统一登录弹窗：由右上角「登录」按钮打开 -->
+  <div class="bk-modal-layer" id="loginModal" hidden>
+    <div class="bk-modal login-modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+      <div class="bk-modal-head">
+        <h3 id="loginModalTitle">登录</h3>
+        <button class="bk-modal-close" id="loginModalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="bk-modal-body">
+        <p class="login-sub">读者用借书证号 / 手机号，馆员用工作账号</p>
+
+        <form id="portalLoginForm" novalidate>
+          <div class="field" id="plFieldAccount">
+            <label for="portalIdentifier">账号</label>
+            <input id="portalIdentifier" name="identifier" type="text" autocomplete="username"
+                   placeholder="借书证号 / 手机号 / 工作账号" />
+          </div>
+
+          <div class="field" id="plFieldPassword">
+            <label for="portalPassword">密码</label>
+            <div class="pw-wrap">
+              <input id="portalPassword" name="password" type="password" autocomplete="current-password"
+                     placeholder="请输入密码" />
+              <button type="button" class="pw-toggle" id="portalPwToggle" aria-label="显示密码">显示</button>
+            </div>
+          </div>
+
+          <div class="login-error" id="portalLoginError" hidden></div>
+
+          <button class="btn btn-primary btn-block" type="submit" id="portalLoginBtn">登录</button>
+        </form>
+
+        <div class="login-hint">
+          <b>读者</b>请使用借书证号或手机号登录，初始密码由馆员告知，登录后可在「我的借阅」里自行修改；
+          <b>馆员</b>使用后台工作账号。登录后系统自动识别身份并进入对应工作台。
+        </div>
+      </div>
     </div>
   </div>
 

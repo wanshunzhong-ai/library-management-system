@@ -20,7 +20,7 @@
   .header-login { padding: 6px 12px; font-size: 13px; }
 }
 
-/* Hero：左侧馆藏检索，右侧统一登录卡 */
+/* Hero：整幅留给馆藏检索，登录统一走右上角弹窗 */
 .hero {
   background:
     radial-gradient(900px 320px at 12% -20%, rgba(47, 111, 235, .16), transparent 62%),
@@ -29,7 +29,7 @@
   border-bottom: 1px solid var(--border);
   padding: 46px 0 40px;
 }
-.hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) 372px; gap: 42px; align-items: center; }
+.hero-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
 .hero-main { min-width: 0; }
 .hero-eyebrow {
   display: inline-block; color: var(--primary); background: var(--primary-soft);
@@ -45,17 +45,12 @@
 .hero-points li::before { content: "✓"; color: var(--primary); font-weight: 700; }
 .hero-points b { color: var(--text); font-weight: 600; }
 
-/* 统一登录卡 */
-.login-panel {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: 16px; box-shadow: var(--shadow-lg); padding: 26px 24px 22px;
-}
-.login-panel .lp-head { margin-bottom: 20px; }
-.login-panel .lp-head h2 { font-size: 21px; margin-bottom: 5px; }
-.login-panel .lp-head p { color: var(--muted); font-size: 12.5px; }
-.login-panel .field { margin-bottom: 14px; }
-.login-panel .login-error { margin-bottom: 12px; }
-.login-panel .login-hint { margin-top: 14px; }
+/* 统一登录弹窗（右上角入口打开） */
+.login-modal { width: 400px; max-width: calc(100vw - 32px); }
+.login-sub { margin: 0 0 16px; color: var(--muted); font-size: 12.5px; }
+.login-modal .field { margin-bottom: 14px; }
+.login-modal .login-error { margin-bottom: 12px; }
+.login-modal .login-hint { margin-top: 14px; }
 
 /* 搜索条 */
 .searchbar {
@@ -89,10 +84,8 @@
 }
 .chip:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
 
-/* 窄屏：登录卡提到最前，保证打开页面第一眼看到登录 */
+/* 窄屏：单列布局，登录入口仍为右上角按钮 */
 @media (max-width: 980px) {
-  .hero-grid { grid-template-columns: 1fr; gap: 26px; }
-  .hero-login { order: -1; }
   .hero-title { font-size: 28px; }
   .hero-points { display: none; }
 }
@@ -104,7 +97,6 @@
   .searchbar { flex-wrap: wrap; padding: 10px; }
   .searchbar input[type="search"] { flex: 1 1 100%; }
   .searchbar select { border-left: 0; padding-left: 4px; }
-  .login-panel { padding: 22px 18px 18px; }
 }
 
 /* 数据条 */
