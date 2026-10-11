@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS members (
     status        TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'frozen')),
     max_borrow    INTEGER NOT NULL DEFAULT 5 CHECK (max_borrow >= 1),
     password_hash TEXT    NOT NULL DEFAULT '',
+    -- 借书证挂失（读者自助保护）：与 status 正交，挂失不影响查看历史，
+    -- 但会挡下借书 / 续借 / 预约，需解挂或换证后恢复。
+    card_lost     INTEGER NOT NULL DEFAULT 0 CHECK (card_lost IN (0, 1)),
+    lost_at       TEXT,
     last_login_at TEXT,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
@@ -71,6 +75,38 @@ CREATE TABLE IF NOT EXISTS admins (
     is_active     INTEGER NOT NULL DEFAULT 1,
     last_login_at TEXT,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- 预约：读者对「暂无可借复本」的图书排队，到书后转为可借并通知。
+-- status 流转：waiting（排队中）→ ready（已到书，可到馆借阅）→ fulfilled（已借出）；
+-- 任一未结束状态都可 cancel（读者取消 / 馆员取消）或 expired（过期未取）。
+CREATE TABLE IF NOT EXISTS reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id     INTEGER NOT NULL REFERENCES books(id)   ON DELETE CASCADE,
+    member_id   INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    status      TEXT    NOT NULL DEFAULT 'waiting'
+                CHECK (status IN ('waiting', 'ready', 'fulfilled', 'cancelled', 'expired')),
+    ready_at    TEXT,
+    notified_at TEXT,
+    closed_at   TEXT,
+    note        TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- 罚金缴纳记录：读者自助缴纳或馆员代收 / 减免。金额一律为正，方向由 kind 区分。
+-- 应缴金额不落库（由 loans + fine.py 统一口径实时计算），这里只记「已经缴了多少」，
+-- 避免把派生数据抄成第二份后与逾期天数脱节。
+CREATE TABLE IF NOT EXISTS fine_payments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_id  INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    loan_id    INTEGER NOT NULL REFERENCES loans(id)   ON DELETE CASCADE,
+    amount     REAL    NOT NULL CHECK (amount >= 0),
+    kind       TEXT    NOT NULL DEFAULT 'payment' CHECK (kind IN ('payment', 'waiver')),
+    method     TEXT    NOT NULL DEFAULT '',
+    note       TEXT    NOT NULL DEFAULT '',
+    operator   TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- 操作日志：谁在什么时候改了什么。分权的前提是能追责，否则拆权限等于拆掉问责能力。
@@ -101,6 +137,14 @@ CREATE INDEX IF NOT EXISTS idx_members_phone    ON members(phone);
 CREATE INDEX IF NOT EXISTS idx_loans_book       ON loans(book_id);
 CREATE INDEX IF NOT EXISTS idx_loans_member     ON loans(member_id);
 CREATE INDEX IF NOT EXISTS idx_loans_open       ON loans(returned_at, due_at);
+-- 预约：按书查排队 / 按读者查我的预约；未结束的唯一约束（同一读者同一本书只能有一条）
+CREATE INDEX IF NOT EXISTS idx_reservations_book   ON reservations(book_id, status, id);
+CREATE INDEX IF NOT EXISTS idx_reservations_member ON reservations(member_id, status, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_open_unique
+    ON reservations(book_id, member_id) WHERE status IN ('waiting', 'ready');
+-- 罚金缴纳：按读者查缴纳历史 / 按借阅记录核对该笔已缴金额
+CREATE INDEX IF NOT EXISTS idx_fine_payments_member ON fine_payments(member_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_fine_payments_loan   ON fine_payments(loan_id);
 CREATE INDEX IF NOT EXISTS idx_logs_created     ON operation_logs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_actor       ON operation_logs(actor_type, actor_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_entity      ON operation_logs(entity, entity_id, id DESC);
@@ -249,6 +293,10 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("members", "last_login_at", "ALTER TABLE members ADD COLUMN last_login_at TEXT"),
     ("books", "barcode", "ALTER TABLE books ADD COLUMN barcode TEXT NOT NULL DEFAULT ''"),
     ("books", "description", "ALTER TABLE books ADD COLUMN description TEXT NOT NULL DEFAULT ''"),
+    # 借书证挂失：独立于 status（frozen 是馆方处置，挂失是读者自我保护），
+    # 因此不能复用 status，否则自助挂失会与"未还清不可冻结"的馆方规则打架。
+    ("members", "card_lost", "ALTER TABLE members ADD COLUMN card_lost INTEGER NOT NULL DEFAULT 0"),
+    ("members", "lost_at", "ALTER TABLE members ADD COLUMN lost_at TEXT"),
 )
 
 # 条码唯一索引必须晚于「列创建 + 存量回填」执行，因此不放进 SCHEMA，

@@ -87,10 +87,12 @@ def _register_blueprints(app: Flask) -> None:
     from library.auth import bp as auth_bp
     from library.books import bp as books_bp
     from library.dashboard import bp as dashboard_bp
+    from library.fines import bp as fines_bp
     from library.loans import bp as loans_bp
     from library.members import bp as members_bp
     from library.public import bp as public_bp
     from library.reader import bp as reader_bp
+    from library.reservations import bp as reservations_bp
 
     app.register_blueprint(public_bp)
     app.register_blueprint(auth_bp)
@@ -98,6 +100,8 @@ def _register_blueprints(app: Flask) -> None:
     app.register_blueprint(books_bp)
     app.register_blueprint(members_bp)
     app.register_blueprint(loans_bp)
+    app.register_blueprint(reservations_bp)
+    app.register_blueprint(fines_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(accounts_bp)
 

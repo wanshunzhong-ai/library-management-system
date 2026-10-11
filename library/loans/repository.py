@@ -17,7 +17,8 @@ SELECT l.id, l.book_id, l.member_id, l.borrowed_at, l.due_at, l.returned_at,
        m.card_no    AS member_card,
        m.name       AS member_name,
        m.phone      AS member_phone,
-       m.status     AS member_status
+       m.status     AS member_status,
+       m.card_lost  AS member_card_lost
   FROM loans l
   JOIN books   b ON b.id = l.book_id
   JOIN members m ON m.id = l.member_id

@@ -31,15 +31,29 @@
   </header>
 
   <main class="wrap reader-main">
-    <section class="card reader-hero">
-      <div>
-        <h1>你好，<span id="welcomeName">读者</span></h1>
-        <p class="hero-sub" id="welcomeMeta">正在加载你的借阅信息…</p>
-        <div class="hero-chips" id="heroChips"></div>
+    <section class="reader-hero-wrap">
+      <section class="card reader-hero">
+        <div>
+          <h1>你好，<span id="welcomeName">读者</span></h1>
+          <p class="hero-sub" id="welcomeMeta">正在加载你的借阅信息…</p>
+          <div class="hero-chips" id="heroChips"></div>
+        </div>
+        <div class="hero-quota">
+          <span class="q-num" id="quotaLeft">—</span>
+          <span class="q-label">剩余可借册数</span>
+        </div>
+      </section>
+      <div class="lost-banner" id="lostBanner" hidden>
+        <span class="lb-ico">⚠</span>
+        <div class="lb-text">
+          <strong>借书证已挂失</strong>
+          <span id="lostHint">挂失期间无法借书、续借与预约。补办新证或确认证件已找回后，可解除挂失。</span>
+        </div>
+        <button class="btn btn-outline btn-mini" type="button" id="unlostBtn">解除挂失</button>
       </div>
-      <div class="hero-quota">
-        <span class="q-num" id="quotaLeft">—</span>
-        <span class="q-label">剩余可借册数</span>
+      <div class="lost-action" id="lostAction">
+        <button class="btn btn-outline btn-mini" type="button" id="lostBtn">借书证挂失</button>
+        <span class="lost-tip">证件遗失时立即挂失，可防止被他人冒用借书；挂失不影响查看历史记录。</span>
       </div>
     </section>
 
@@ -72,6 +86,67 @@
         </table>
       </div>
       <div class="pager" id="loanPager"></div>
+    </section>
+
+    <section class="reader-cols">
+      <div class="card reader-panel">
+        <div class="panel-head">
+          <h2>我的预约</h2>
+          <span class="sub" id="reservationSummary">—</span>
+        </div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>图书</th>
+                <th>预约时间</th>
+                <th>状态 / 位次</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="reservationBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card reader-panel">
+        <div class="panel-head">
+          <h2>预约图书</h2>
+          <span class="sub">暂无可借复本时可排队，到书后在此提示</span>
+        </div>
+        <form class="reserve-search" id="reserveSearchForm" novalidate>
+          <input id="reserveKeyword" type="text" placeholder="输入书名 / 作者 / ISBN / 条码" autocomplete="off" />
+          <button class="btn btn-primary" type="submit" id="reserveSearchBtn">搜索</button>
+        </form>
+        <div class="reserve-results" id="reserveResults">
+          <div class="reserve-hint">搜索书名后，对「已借完」的图书可点击「预约」排队。</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card reader-panel">
+      <div class="panel-head">
+        <h2>滞纳金</h2>
+        <span class="sub" id="fineSummary">—</span>
+        <button class="btn btn-primary btn-mini" type="button" id="payAllBtn" hidden>一次结清</button>
+      </div>
+      <div class="table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>图书</th>
+              <th>逾期天数</th>
+              <th>应缴</th>
+              <th>已缴</th>
+              <th>待缴</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="fineBody"></tbody>
+        </table>
+      </div>
+      <div class="panel-note" id="fineNote">滞纳金按逾期整日计算，单笔封顶；在借逾期会持续累加，建议尽快归还。</div>
+      <div class="fine-history" id="fineHistory"></div>
     </section>
 
     <section class="reader-cols">

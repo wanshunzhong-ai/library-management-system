@@ -351,6 +351,7 @@
     books: { title: "图书管理", sub: "维护馆藏书目与库存" },
     members: { title: "读者管理", sub: "维护读者档案与借阅权限" },
     loans: { title: "借阅管理", sub: "办理借书、还书与续借" },
+    reservations: { title: "预约管理", sub: "查看预约队列、通知到书与取消", permission: "loan:write" },
     accounts: { title: "账号管理", sub: "后台账号、角色与启停用", permission: "account:manage" },
     logs: { title: "操作日志", sub: "谁在什么时候改了什么", permission: "log:read" },
   };
@@ -360,6 +361,7 @@
     books: { page: 1, pageSize: 10, keyword: "", category: "", availableOnly: false, sort: "", order: "" },
     members: { page: 1, pageSize: 10, keyword: "", status: "", sort: "", order: "" },
     loans: { page: 1, pageSize: 10, keyword: "", status: "all", sort: "", order: "" },
+    reservations: { page: 1, pageSize: 10, keyword: "", status: "waiting" },
     accounts: { keyword: "" },
     logs: { page: 1, pageSize: 20, keyword: "", actorType: "", action: "", status: "" },
     categories: [],
@@ -380,6 +382,10 @@
     loans: {
       table: "#loanTable",
       headers: ["选择", "图书", "读者", "借出日期", "应还日期", "归还日期", "续借", "状态", "罚金", "操作"],
+    },
+    reservations: {
+      table: "#reservationTable",
+      headers: ["图书", "读者", "预约时间", "状态", "到书时间", "操作"],
     },
     accounts: {
       table: "#accountTable",
@@ -520,6 +526,12 @@
     } else if (view === "loans") {
       write(state.loans);
       if (state.loans.status && state.loans.status !== "all") params.set("st", state.loans.status);
+    } else if (view === "reservations") {
+      const s = state.reservations;
+      if (s.keyword) params.set("kw", s.keyword);
+      if (s.page > 1) params.set("page", String(s.page));
+      if (s.pageSize !== DEFAULT_PAGE_SIZE) params.set("size", String(s.pageSize));
+      if (s.status && s.status !== "waiting") params.set("st", s.status);
     } else if (view === "accounts") {
       if (state.accounts.keyword) params.set("kw", state.accounts.keyword);
     } else if (view === "logs") {
@@ -561,6 +573,12 @@
       $("#loanKeyword").value = state.loans.keyword;
       document.querySelectorAll("#loanTabs .tab").forEach((t) =>
         t.classList.toggle("is-active", t.dataset.status === state.loans.status)
+      );
+    } else if (v === "reservations") {
+      const box = $("#reservationKeyword");
+      if (box) box.value = state.reservations.keyword;
+      document.querySelectorAll("#reservationTabs .tab").forEach((t) =>
+        t.classList.toggle("is-active", t.dataset.status === state.reservations.status)
       );
     } else if (v === "accounts") {
       const box = $("#accountKeyword");
@@ -614,6 +632,13 @@
       });
     } else if (view === "accounts") {
       Object.assign(state.accounts, { keyword: kw });
+    } else if (view === "reservations") {
+      Object.assign(state.reservations, {
+        keyword: kw,
+        status: params.get("st") || "waiting",
+        page,
+        pageSize: size,
+      });
     } else if (view === "logs") {
       Object.assign(state.logs, {
         keyword: kw,
@@ -1502,6 +1527,142 @@
     loadLoans().catch(showError);
   }
 
+  /* ---------------- 预约管理视图 ---------------- */
+
+  function reservationBadge(r) {
+    if (r.status === "waiting") {
+      const pos = Number(r.queue_position) || 0;
+      return `<span class="badge info">排队中${pos ? ` · 第 ${pos} 位` : ""}</span>`;
+    }
+    if (r.status === "ready") return `<span class="badge success">已到书</span>`;
+    if (r.status === "fulfilled") return `<span class="badge neutral">已借出</span>`;
+    if (r.status === "cancelled") return `<span class="badge neutral">已取消</span>`;
+    if (r.status === "expired") return `<span class="badge warn">已过期</span>`;
+    return `<span class="badge neutral">${esc(r.status_label || r.status || "")}</span>`;
+  }
+
+  async function loadReservations() {
+    const s = state.reservations;
+    await withViewLoading("reservations", async () => {
+      const payload = await api.get("/api/reservations", {
+        keyword: s.keyword,
+        status: s.status,
+        page: s.page,
+        page_size: s.pageSize,
+      });
+      const table = $("#reservationTable");
+      if (!payload.items.length) {
+        const hasFilter = Boolean(s.keyword || (s.status && s.status !== "waiting"));
+        table.innerHTML = emptyState(6, "没有匹配的预约记录", hasFilter ? "清除筛选条件" : "");
+        const clear = table.querySelector("[data-clear]");
+        if (clear) clear.addEventListener("click", resetReservations);
+      } else {
+        const writable = can("loan:write");
+        table.innerHTML = `
+          <thead><tr>
+            <th>图书</th><th>读者</th><th>预约时间</th><th>状态</th><th>到书时间</th><th>操作</th>
+          </tr></thead>
+          <tbody>${payload.items
+            .map((r) => {
+              const open = r.status === "waiting" || r.status === "ready";
+              let actions = '<span class="sub">—</span>';
+              if (writable) {
+                const parts = [];
+                if (r.can_ready) {
+                  parts.push(`<button class="btn sm" data-ready="${r.id}"
+                          data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}">通知到书</button>`);
+                }
+                parts.push(`<button class="btn sm ghost" data-cancel="${r.id}" ${open ? "" : "disabled"}
+                          data-book="${esc(r.book_title)}" data-member="${esc(r.member_name)}">取消</button>`);
+                actions = `<div class="actions">${parts.join("")}</div>`;
+              }
+              return `<tr>
+                <td class="wrap title-cell"><strong>${esc(r.book_title)}</strong><div class="sub">${esc(r.book_barcode || "—")} · 可借 ${Number(r.available_copies) || 0}/${Number(r.total_copies) || 0}</div></td>
+                <td>${esc(r.member_name)}<div class="sub">${esc(r.member_card)}</div></td>
+                <td class="sub">${esc(fmtDateTime(r.created_at))}</td>
+                <td>${reservationBadge(r)}</td>
+                <td class="sub">${r.ready_at ? esc(fmtDateTime(r.ready_at)) : "—"}</td>
+                <td>${actions}</td>
+              </tr>`;
+            })
+            .join("")}</tbody>`;
+      }
+
+      renderPager($("#reservationPager"), payload, (patch) => updateFilters(patch));
+
+      const hint = $("#reservationHint");
+      if (hint) {
+        const waiting = Number(payload.waiting_total) || 0;
+        hint.textContent = waiting ? `当前排队中 ${waiting} 条，还书后将自动按序通知` : "暂无排队中的预约";
+      }
+
+      table.querySelectorAll("[data-ready]").forEach((btn) =>
+        btn.addEventListener("click", () =>
+          doReservationReady(Number(btn.dataset.ready), {
+            book: btn.dataset.book,
+            member: btn.dataset.member,
+          })
+        )
+      );
+      table.querySelectorAll("[data-cancel]").forEach((btn) =>
+        btn.addEventListener("click", () =>
+          doReservationCancel(Number(btn.dataset.cancel), {
+            book: btn.dataset.book,
+            member: btn.dataset.member,
+          })
+        )
+      );
+    });
+  }
+
+  function resetReservations() {
+    state.reservations = { page: 1, pageSize: state.reservations.pageSize, keyword: "", status: "waiting" };
+    const box = $("#reservationKeyword");
+    if (box) box.value = "";
+    document.querySelectorAll("#reservationTabs .tab").forEach((t) =>
+      t.classList.toggle("is-active", t.dataset.status === "waiting")
+    );
+    syncUrl();
+    loadReservations().catch(showError);
+  }
+
+  /** 通知到书：把排队中的预约置为「已到书」。 */
+  function doReservationReady(id, info) {
+    const ctx = info || {};
+    const label = ctx.book ? `《${esc(ctx.book)}》` : `预约 #${id}`;
+    const reader = ctx.member ? `读者 ${esc(ctx.member)}` : "";
+    openModal({
+      title: "通知到书",
+      body: `<p>确认通知 ${reader || "该读者"} 到馆借阅 ${label}？</p>
+             <div class="form-note">通知后该预约进入「已到书」，读者在个人中心即可看到「请到馆借阅」提示。</div>`,
+      confirmText: "确认通知",
+      onSubmit: async () => {
+        await api.post(`/api/reservations/${id}/ready`, {});
+        toast("已通知到书", `${label}${reader ? ` · ${reader}` : ""} 已转入「已到书」`, "ok");
+        await loadReservations();
+      },
+    });
+  }
+
+  /** 取消预约：把未结束的预约置为「已取消」。 */
+  function doReservationCancel(id, info) {
+    const ctx = info || {};
+    const label = ctx.book ? `《${esc(ctx.book)}》` : `预约 #${id}`;
+    const reader = ctx.member ? `读者 ${esc(ctx.member)}` : "该读者";
+    openModal({
+      title: "取消预约",
+      body: `<p>确定取消 ${reader} 对 ${label} 的预约？</p>
+             <div class="form-note">取消后该读者不再保留排队位次；如需重新借阅可再次发起预约。</div>`,
+      confirmText: "取消预约",
+      danger: true,
+      onSubmit: async () => {
+        await api.post(`/api/reservations/${id}/cancel`, {});
+        toast("已取消预约", `${label} · ${reader}`, "ok");
+        await loadReservations();
+      },
+    });
+  }
+
   /** 同步「批量还书」按钮与全选框状态（选中数 / 半选）。 */
   function updateSelection() {
     const table = $("#loanTable");
@@ -2151,6 +2312,7 @@
     if (state.view === "books") return Promise.all([loadBooks(), loadCategories()]);
     if (state.view === "members") return loadMembers();
     if (state.view === "loans") return loadLoans();
+    if (state.view === "reservations") return loadReservations();
     if (state.view === "accounts") return loadAccounts();
     if (state.view === "logs") return loadLogs();
   }
@@ -2585,6 +2747,25 @@
     $("#loanBorrow").addEventListener("click", () => openBorrowForm(null));
     $("#loanExport").addEventListener("click", () => exportLoans());
     $("#loanReturnBatch").addEventListener("click", openBatchReturn);
+
+    // 预约管理（仅具备 loan:write 的账号可见，节点由 applyPermissions 控制显隐）
+    const reservationTabs = $("#reservationTabs");
+    if (reservationTabs) {
+      reservationTabs.addEventListener("click", (e) => {
+        const tab = e.target.closest(".tab");
+        if (!tab) return;
+        updateFilters({ status: tab.dataset.status, page: 1 });
+      });
+    }
+    const reservationKw = $("#reservationKeyword");
+    if (reservationKw) {
+      reservationKw.addEventListener(
+        "input",
+        debounce((e) => updateFilters({ keyword: e.target.value.trim(), page: 1 }), 300)
+      );
+    }
+    const reservationResetBtn = $("#reservationReset");
+    if (reservationResetBtn) reservationResetBtn.addEventListener("click", resetReservations);
 
     $("#modalClose").addEventListener("click", closeModal);
     $("#modalLayer").addEventListener("click", (e) => {

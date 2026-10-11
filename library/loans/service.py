@@ -48,12 +48,13 @@ def _decorate(row: Mapping[str, Any]) -> dict[str, Any]:
     item["fine"] = settlement["fine"]
     item["fine_capped"] = settlement["capped"]
     item["status_label"] = STATUS_LABELS[item["status"]]
-    # 可续借 = 在借 + 未逾期 + 未达次数上限 + 读者未被冻结。
+    # 可续借 = 在借 + 未逾期 + 未达次数上限 + 读者未被冻结且借书证未挂失。
     # 与 renew() 的真实闸门保持同一口径，避免出现「按钮可点但必然失败」。
     item["can_renew"] = (
         item["status"] == "borrowed"
         and int(item.get("renew_count") or 0) < get_config().max_renew
         and (item.get("member_status") or "active") == "active"
+        and not int(item.get("member_card_lost") or 0)
     )
     return item
 
@@ -114,6 +115,8 @@ def borrow(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise NotFoundError(f"读者 #{member_id} 不存在")
         if member["status"] != "active":
             raise BusinessRuleError(f"读者「{member['name']}」已被冻结，无法借书")
+        if int(member.get("card_lost") or 0):
+            raise BusinessRuleError(f"读者「{member['name']}」的借书证已挂失，请先解挂或补办后再借书")
 
         book = book_repo.get(book_id)
         if book is None:
@@ -149,6 +152,9 @@ def borrow(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ConflictError(f"读者已借阅《{book['title']}》且尚未归还") from exc
         loan_id = int(cur.lastrowid or 0)
 
+    # 借出成功后把该读者对该书的未结束预约结单（增强逻辑，失败只告警）
+    _chain_reservation_fulfilled(book_id, member_id)
+
     return get_loan(loan_id)
 
 
@@ -181,6 +187,9 @@ def return_book(loan_id: int) -> dict[str, Any]:
                 "还书未回补库存（可借数已达总册数）",
                 extra={"extra_fields": {"loan_id": loan_id, "book_id": loan["book_id"]}},
             )
+
+    # 回补库存后唤醒预约队列：有可借复本则把最早的排队预约置为「已到书」
+    _chain_reservation_ready(int(loan["book_id"]))
 
     return get_loan(loan_id)
 
@@ -250,10 +259,12 @@ def renew(loan_id: int) -> dict[str, Any]:
 
     with db.transaction(immediate=True) as conn:
         # 读者状态校验放进事务：管理端续借与读者端自助续借（reader/service）口径一致，
-        # 冻结读者不可续借；同时与列表 can_renew 的展示口径保持一致。
+        # 冻结读者 / 已挂失借书证都不可续借；同时与列表 can_renew 的展示口径保持一致。
         member = member_repo.get(int(loan["member_id"]))
         if member is not None and member["status"] != "active":
             raise BusinessRuleError(f"读者「{member['name']}」已被冻结，暂时无法续借")
+        if member is not None and int(member.get("card_lost") or 0):
+            raise BusinessRuleError(f"读者「{member['name']}」的借书证已挂失，请先解挂后再续借")
 
         if int(loan["renew_count"]) >= cfg.max_renew:
             raise BusinessRuleError(f"续借次数已达上限（{cfg.max_renew} 次）")
@@ -288,3 +299,26 @@ def loans_of_member(member_id: int) -> dict[str, Any]:
 
 def loans_of_book(book_id: int) -> dict[str, Any]:
     return list_loans({"book_id": book_id, "status": "all", "page": 1, "page_size": 100})
+
+
+# ---------------------------------------------------------------- 预约联动
+# 借还路径与预约模块解耦：这里只做一次延迟导入，且任何异常都吞掉。
+# 预约是增强能力，绝不能因为预约表出问题就让一次正常的借书 / 还书失败。
+
+
+def _chain_reservation_ready(book_id: int) -> None:
+    try:
+        from library.reservations import service as reservation_service  # noqa: PLC0415
+
+        reservation_service.on_book_returned(book_id)
+    except Exception:  # noqa: BLE001 - 见上方说明
+        logger.warning("预约唤队联动失败（已忽略）", exc_info=True)
+
+
+def _chain_reservation_fulfilled(book_id: int, member_id: int) -> None:
+    try:
+        from library.reservations import service as reservation_service  # noqa: PLC0415
+
+        reservation_service.on_book_borrowed(book_id, member_id)
+    except Exception:  # noqa: BLE001 - 见上方说明
+        logger.warning("预约结单联动失败（已忽略）", exc_info=True)

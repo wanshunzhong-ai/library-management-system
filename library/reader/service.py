@@ -65,6 +65,8 @@ def public_member(row: Mapping[str, Any]) -> dict[str, Any]:
         "member_type": row["member_type"],
         "status": row["status"],
         "max_borrow": int(row["max_borrow"]),
+        "card_lost": bool(row.get("card_lost")),
+        "lost_at": row.get("lost_at"),
         "last_login_at": row.get("last_login_at"),
     }
 
@@ -240,6 +242,8 @@ def me() -> dict[str, Any]:
     return {
         "member": member,
         "stats": stats(member),
+        "reservations": _reservation_summary(member),
+        "fines": _fine_summary(member),
         "rules": {
             "loan_days": cfg.loan_days,
             "max_renew": cfg.max_renew,
@@ -249,6 +253,28 @@ def me() -> dict[str, Any]:
         },
         "library": {"name": cfg.library_name, "slogan": cfg.library_slogan},
         "csrf_token": csrf_token(),
+    }
+
+
+def _reservation_summary(member: Mapping[str, Any]) -> dict[str, Any]:
+    from library.reservations import repository as reservation_repo  # noqa: PLC0415
+
+    member_id = int(member["id"])
+    return {
+        "open_total": reservation_repo.count_for_member(member_id, "open"),
+        "ready_total": reservation_repo.count_for_member(member_id, "ready"),
+    }
+
+
+def _fine_summary(member: Mapping[str, Any]) -> dict[str, Any]:
+    from library.fines import service as fine_service  # noqa: PLC0415
+
+    overview = fine_service.overview(member)
+    return {
+        "total_outstanding": overview["total_outstanding"],
+        "total_paid": overview["total_paid"],
+        "total_waived": overview["total_waived"],
+        "item_count": len(overview["items"]),
     }
 
 
@@ -282,6 +308,8 @@ def renew_my_loan(member: Mapping[str, Any], loan_id: int) -> dict[str, Any]:
         raise ForbiddenError("只能续借本人的借阅记录")
     if member["status"] != "active":
         raise BusinessRuleError("账号已被冻结，暂时无法自助续借，请联系管理员")
+    if member.get("card_lost"):
+        raise BusinessRuleError("借书证已挂失，请先解除挂失再续借")
 
     result = loan_service.renew(loan_id)
     logger.info(
@@ -318,3 +346,83 @@ def change_password(member: Mapping[str, Any], old_password: str, new_password: 
     member_repo.update_password_hash(int(member["id"]), hash_password(new_password))
     logout()  # 改密后强制重新登录
     logger.info("读者修改密码", extra={"extra_fields": {"member_id": member["id"]}})
+
+
+# ---------------------------------------------------------------- 预约（读者侧）
+
+
+def list_my_reservations(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.reservations import service as reservation_service  # noqa: PLC0415
+
+    return reservation_service.list_my_reservations(member, query)
+
+
+def create_reservation(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.reservations import service as reservation_service  # noqa: PLC0415
+
+    return reservation_service.reserve(member, payload)
+
+
+def cancel_reservation(member: Mapping[str, Any], res_id: int) -> dict[str, Any]:
+    from library.reservations import service as reservation_service  # noqa: PLC0415
+
+    return reservation_service.cancel_my_reservation(member, res_id)
+
+
+def search_books_for_reserve(query: Mapping[str, Any]) -> dict[str, Any]:
+    """预约前的图书检索：复用门户检索口径，只返回可预约相关的馆藏信息。"""
+    from library.books import service as book_service  # noqa: PLC0415
+
+    return book_service.list_books(
+        {
+            "keyword": query.get("keyword", ""),
+            "category": query.get("category", ""),
+            "page": query.get("page", 1),
+            "page_size": query.get("page_size", 8),
+        }
+    )
+
+
+# ---------------------------------------------------------------- 滞纳金（读者侧）
+
+
+def fines_overview(member: Mapping[str, Any]) -> dict[str, Any]:
+    from library.fines import service as fine_service  # noqa: PLC0415
+
+    return fine_service.overview(member)
+
+
+def pay_fines(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.fines import service as fine_service  # noqa: PLC0415
+
+    result = fine_service.pay(member, payload)
+    logger.info(
+        "读者自助缴纳滞纳金",
+        extra={"extra_fields": {"member_id": member["id"], "amount": result.get("paid_total")}},
+    )
+    return result
+
+
+# ---------------------------------------------------------------- 借书证挂失
+
+
+def set_card_lost(member: Mapping[str, Any], lost: bool) -> dict[str, Any]:
+    """读者自助挂失 / 解挂。
+
+    挂失是读者的自我保护动作，独立于馆方的 ``status``（冻结）——因此即便读者
+    仍有未还图书也能挂失（挂失只是锁住"用这张证借书"的能力，不影响已借记录）。
+    """
+    member_id = int(member["id"])
+    row = member_repo.get(member_id)
+    if row is None:
+        raise NotFoundError("读者账号不存在")
+    currently = bool(row.get("card_lost"))
+    if currently == bool(lost):
+        return public_member(member_repo.get(member_id) or row)
+
+    member_repo.set_card_lost(member_id, bool(lost))
+    logger.warning(
+        "读者借书证状态变更",
+        extra={"extra_fields": {"member_id": member_id, "card_lost": bool(lost)}},
+    )
+    return public_member(member_repo.get(member_id) or row)

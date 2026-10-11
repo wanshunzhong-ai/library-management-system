@@ -9,7 +9,7 @@ from library import db
 # 对外返回的字段（绝不包含 password_hash）
 _PUBLIC_COLUMNS = (
     "id, card_no, name, phone, email, member_type, status, max_borrow, "
-    "last_login_at, created_at, updated_at"
+    "card_lost, lost_at, last_login_at, created_at, updated_at"
 )
 # 鉴权专用：额外带出密码哈希，仅 reader 登录流程内部使用
 _AUTH_COLUMNS = f"{_PUBLIC_COLUMNS}, password_hash"
@@ -153,6 +153,22 @@ def update_password_hash(member_id: int, password_hash: str) -> None:
         "UPDATE members SET password_hash = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
         [password_hash, member_id],
     )
+
+
+def set_card_lost(member_id: int, lost: bool) -> None:
+    """借书证挂失 / 解挂。挂失时间只在挂失时写入，解挂清空。"""
+    if lost:
+        db.execute(
+            "UPDATE members SET card_lost = 1, lost_at = datetime('now', 'localtime'), "
+            "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+            [member_id],
+        )
+    else:
+        db.execute(
+            "UPDATE members SET card_lost = 0, lost_at = NULL, "
+            "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+            [member_id],
+        )
 
 
 def touch_login(member_id: int) -> None:

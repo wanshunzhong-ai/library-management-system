@@ -1796,6 +1796,342 @@ def main() -> int:
     )
     check("停用账号 / 拦截记录有降噪样式", "is-inactive" in css_role and "is-inactive" in js_role)
 
+    print("\n=== 30. 预约队列、滞纳金缴纳与借书证挂失 ===")
+    # 用独立库跑这一段：预约/缴费是一次性状态迁移（缴了就没了），
+    # 混在主库里会与前后用例互相污染。独立库还能自由回填 due_at 造逾期。
+    res_root = Path(tempfile.mkdtemp(prefix="resv-smoke-"))
+    res_app = build_app(str(res_root / "resv.db"))
+    radmin = Api(res_app.test_client())
+    radmin.csrf = (radmin.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD}).get_json() or {}).get("csrf_token")
+
+    def new_member(card: str, name: str) -> int:
+        r = radmin.post(
+            "/api/members",
+            json={"card_no": card, "name": name, "member_type": "学生", "status": "active", "max_borrow": 50},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def new_book(isbn: str, title: str, total: int = 1) -> int:
+        r = radmin.post(
+            "/api/books",
+            json={"isbn": isbn, "title": title, "category": "预约测试", "total_copies": total},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def borrow(book_id: int, member_id: int):
+        return radmin.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id})
+
+    def reader_session(card: str):
+        client = res_app.test_client()
+        r = client.post("/api/reader/login", json={"account": card, "password": card})
+        assert r.status_code == 200, r.get_json()
+        return client, {"X-CSRF-Token": (r.get_json() or {}).get("csrf_token")}
+
+    def backdate_due(loan_id: int, days_ago: int) -> None:
+        """把某笔在借的应还日期回填到 N 天前（造逾期用）。"""
+        with res_app.app_context():
+            db.execute(
+                "UPDATE loans SET due_at = ? WHERE id = ?",
+                [timeutil.to_str(timeutil.now() - timedelta(days=days_ago)), loan_id],
+            )
+
+    m_jia = new_member("RS0001", "预约测试甲")
+    m_yi = new_member("RS0002", "预约测试乙")
+    m_bing = new_member("RS0003", "预约测试丙")
+
+    b_wei = new_book("9787888000001", "预约测试·唯一复本")
+    b_avail = new_book("9787888000002", "预约测试·有库存")
+    b_ready = new_book("9787888000003", "预约测试·到书")
+    b_ful = new_book("9787888000004", "预约测试·借出")
+    b_cancel = new_book("9787888000005", "预约测试·取消")
+    b_over = new_book("9787888000006", "预约测试·逾期")
+    b_cap = new_book("9787888000007", "预约测试·封顶")
+    b_today = new_book("9787888000008", "预约测试·当天")
+    b_admin = new_book("9787888000009", "预约测试·代收")
+    b_wv = new_book("9787888000010", "预约测试·减免")
+    b_l3 = new_book("9787888000011", "预约测试·挂失预约")
+    b_lost = new_book("9787888000012", "预约测试·挂失在借")
+    b_l2 = new_book("9787888000013", "预约测试·挂失后借书")
+
+    # 所有借书必须在「回填逾期」之前完成 —— 有逾期未还的读者不能再借书。
+    loan_wei = borrow(b_wei, m_jia).get_json()
+    loan_ready = borrow(b_ready, m_jia).get_json()
+    loan_cancel = borrow(b_cancel, m_jia).get_json()
+    loan_ful = borrow(b_ful, m_jia).get_json()
+    loan_over = borrow(b_over, m_jia).get_json()
+    loan_cap = borrow(b_cap, m_jia).get_json()
+    loan_today = borrow(b_today, m_jia).get_json()
+    # 代收 / 减免用丙的书：甲一会儿会「一次结清」，会把甲名下所有待缴都清掉，
+    # 馆员侧那两步就无单可结了。
+    loan_admin = borrow(b_admin, m_bing).get_json()
+    loan_wv = borrow(b_wv, m_bing).get_json()
+    loan_l3 = borrow(b_l3, m_jia).get_json()
+    loan_lost = borrow(b_lost, m_yi).get_json()
+    check(
+        "前提：借书成功且库存扣减",
+        all(x.get("id") for x in (loan_wei, loan_ready, loan_cancel, loan_ful, loan_over, loan_cap, loan_lost)),
+        loan_wei,
+    )
+
+    c_yi, h_yi = reader_session("RS0002")
+    c_bing, h_bing = reader_session("RS0003")
+
+    # ---- 30.1 预约状态机：排队 → 到书 → 借出 ----
+    res = c_yi.post("/api/reader/reservations", json={"book_id": b_wei}, headers=h_yi)
+    body = res.get_json() or {}
+    check("读者可预约「无可借复本」的图书", res.status_code in (200, 201), body)
+    check("预约初始状态为「排队中」", body.get("status") == "waiting" and body.get("status_label") == "排队中", body)
+    check("排队位次为第 1 位", body.get("queue_position") == 1, body)
+    res_id = int(body.get("id") or 0)
+
+    dup = c_yi.post("/api/reader/reservations", json={"book_id": b_wei}, headers=h_yi)
+    check("同一读者重复预约被拒（409）", dup.status_code == 409, dup.get_json())
+
+    avail = c_yi.post("/api/reader/reservations", json={"book_id": b_avail}, headers=h_yi)
+    check("有可借复本时不允许预约（422）", avail.status_code == 422, avail.get_json())
+
+    me_yi = c_yi.get("/api/reader/me").get_json()
+    check("读者中心暴露预约汇总", me_yi["reservations"]["open_total"] == 1, me_yi.get("reservations"))
+
+    check("前提：甲的《唯一复本》归还成功", radmin.post(f"/api/loans/{loan_wei['id']}/return").status_code == 200)
+    mine = next(
+        (i for i in c_yi.get("/api/reader/reservations", query_string={"status": "all"}).get_json()["items"] if i["id"] == res_id),
+        {},
+    )
+    check("还书后预约自动转「已到书」（到书通知）", mine.get("status") == "ready" and mine.get("status_label") == "已到书", mine)
+
+    check("前提：乙借走该复本", borrow(b_wei, m_yi).status_code in (200, 201))
+    mine = next(
+        (i for i in c_yi.get("/api/reader/reservations", query_string={"status": "all"}).get_json()["items"] if i["id"] == res_id),
+        {},
+    )
+    check("读者借出后预约自动结单为「已借出」", mine.get("status") == "fulfilled", mine)
+
+    # 馆员侧手动通知到书
+    res_ready = c_bing.post("/api/reader/reservations", json={"book_id": b_ready}, headers=h_bing).get_json() or {}
+    notified = radmin.post(f"/api/reservations/{res_ready.get('id')}/ready")
+    check("馆员可手动「通知到书」", notified.status_code == 200 and notified.get_json().get("status") == "ready", notified.get_json())
+    again = radmin.post(f"/api/reservations/{res_ready.get('id')}/ready")
+    check("重复通知到书被拒（422）", again.status_code == 422, again.get_json())
+
+    # 取消 + 越权
+    res_cancel = c_bing.post("/api/reader/reservations", json={"book_id": b_cancel}, headers=h_bing).get_json() or {}
+    other = c_yi.post(f"/api/reader/reservations/{res_cancel.get('id')}/cancel", headers=h_yi)
+    check("取消他人预约被拒（403）", other.status_code == 403, other.get_json())
+    own = c_bing.post(f"/api/reader/reservations/{res_cancel.get('id')}/cancel", headers=h_bing)
+    check("本人可取消预约（转「已取消」）", own.status_code == 200 and own.get_json().get("status") == "cancelled", own.get_json())
+
+    # 馆员列表 / 关键字 / 状态过滤（关键字要跨表 JOIN，曾因 COUNT 少 JOIN 直接 500）
+    all_res = radmin.get("/api/reservations", query_string={"page_size": 100}).get_json()
+    check("馆员可查看全部预约", all_res["total"] >= 3, all_res.get("total"))
+    check("馆员接口附带「排队中总数」", "waiting_total" in all_res, all_res.get("waiting_total"))
+    kw_book = radmin.get("/api/reservations", query_string={"keyword": "到书", "page_size": 100}).get_json()
+    check(
+        "预约列表按书名过滤（覆盖计数路径的 JOIN）",
+        kw_book["total"] >= 1 and all("到书" in i["book_title"] for i in kw_book["items"]),
+        kw_book.get("total"),
+    )
+    kw_member = radmin.get("/api/reservations", query_string={"keyword": "预约测试乙", "page_size": 100}).get_json()
+    check(
+        "预约列表按读者姓名过滤（覆盖计数路径的 JOIN）",
+        kw_member["total"] >= 1 and all(i["member_name"] == "预约测试乙" for i in kw_member["items"]),
+        kw_member.get("total"),
+    )
+    kw_none = radmin.get("/api/reservations", query_string={"keyword": "查无此书XYZ", "page_size": 100}).get_json()
+    check("预约关键字无命中时返回空集而非报错", kw_none["total"] == 0 and kw_none["items"] == [], kw_none.get("total"))
+    st_cancel = radmin.get("/api/reservations", query_string={"status": "cancelled", "page_size": 100}).get_json()
+    check(
+        "预约列表按状态过滤",
+        st_cancel["total"] >= 1 and all(i["status"] == "cancelled" for i in st_cancel["items"]),
+        st_cancel.get("total"),
+    )
+
+    anon = res_app.test_client()
+    check("未登录读预约列表 401", anon.get("/api/reservations").status_code == 401)
+    check("未登录读缴费流水 401", anon.get("/api/fines").status_code == 401)
+    check("读者会话调馆员预约接口 401", c_yi.get("/api/reservations").status_code == 401)
+
+    # ---- 30.2 滞纳金：整日口径 + 封顶 + 读者自助缴纳 ----
+    backdate_due(loan_over["id"], 10)
+    backdate_due(loan_cap["id"], 200)
+    backdate_due(loan_admin["id"], 6)
+    backdate_due(loan_wv["id"], 4)
+    with res_app.app_context():
+        # 应还「今天 00:00」：整日口径下逾期 0 天，不应产生罚金
+        db.execute(
+            "UPDATE loans SET due_at = ? WHERE id = ?",
+            [timeutil.to_str(timeutil.now().replace(hour=0, minute=0, second=0, microsecond=0)), loan_today["id"]],
+        )
+
+    c_jia, h_jia = reader_session("RS0001")
+    fines = c_jia.get("/api/reader/fines").get_json()
+    rules = fines["rules"]
+    per_day = float(rules["fine_per_day"])
+    cap = float(rules["fine_cap"])
+    item_over = next((i for i in fines["items"] if i["loan_id"] == loan_over["id"]), None)
+    check("逾期在借会进入读者的待缴明细", item_over is not None, fines.get("items"))
+    check("逾期 10 天罚金 = 天数 × 日标准", abs(item_over["fine"] - round(10 * per_day, 2)) < 1e-6, item_over)
+    check("未结算时「待缴」等于「应缴」", abs(item_over["outstanding"] - item_over["fine"]) < 1e-6, item_over)
+    check("在借逾期标注为「在借逾期」", item_over["state"] == "overdue" and item_over["state_label"] == "在借逾期", item_over)
+    check(
+        "汇总待缴 = 明细逐笔相加（口径统一）",
+        abs(fines["total_outstanding"] - round(sum(i["outstanding"] for i in fines["items"]), 2)) < 1e-6,
+        fines.get("total_outstanding"),
+    )
+    item_cap = next((i for i in fines["items"] if i["loan_id"] == loan_cap["id"]), None)
+    check("超长逾期按封顶金额计费", item_cap is not None and abs(item_cap["fine"] - cap) < 1e-6, item_cap)
+    check("封顶记录带 capped 标记", item_cap.get("capped") is True, item_cap)
+    check("封顶不改变真实逾期天数", item_cap["overdue_days"] == 200, item_cap)
+    check("应还当天不算逾期、不产生待缴（整日口径）", all(i["loan_id"] != loan_today["id"] for i in fines["items"]), fines.get("items"))
+
+    reader_me = c_jia.get("/api/reader/me").get_json()
+    check(
+        "读者中心待缴汇总与滞纳金面板一致",
+        abs(reader_me["fines"]["total_outstanding"] - fines["total_outstanding"]) < 1e-6,
+        (reader_me["fines"], fines["total_outstanding"]),
+    )
+
+    paid_before = float(fines["total_paid"])
+    pay_one = c_jia.post("/api/reader/fines/pay", json={"loan_id": loan_over["id"]}, headers=h_jia)
+    pay_body = pay_one.get_json() or {}
+    check("读者可自助缴纳单笔滞纳金", pay_one.status_code == 200, pay_body)
+    check("缴纳金额等于该笔待缴", abs(pay_body.get("paid_total", -1) - item_over["outstanding"]) < 1e-6, pay_body)
+    check("缴纳后该笔不再出现在待缴明细", all(i["loan_id"] != loan_over["id"] for i in pay_body["overview"]["items"]))
+    check(
+        "缴纳后累计已缴正确累加",
+        abs(pay_body["overview"]["total_paid"] - paid_before - pay_body["paid_total"]) < 1e-6,
+        pay_body["overview"].get("total_paid"),
+    )
+    check("缴纳历史留有流水", len(pay_body["overview"]["history"]) >= 1, len(pay_body["overview"]["history"]))
+    repay = c_jia.post("/api/reader/fines/pay", json={"loan_id": loan_over["id"]}, headers=h_jia)
+    check("重复缴纳同一笔被拒（404/422）", repay.status_code in (404, 422), repay.status_code)
+
+    pay_all = c_jia.post("/api/reader/fines/pay", json={"all": True}, headers=h_jia)
+    check("读者可一次结清全部待缴", pay_all.status_code == 200, pay_all.get_json())
+    check("结清后待缴归零", pay_all.get_json()["overview"]["total_outstanding"] == 0, pay_all.get_json()["overview"].get("total_outstanding"))
+
+    # ---- 30.3 馆员代收 / 减免（用丙的账，避免被甲的「一次结清」提前清掉）----
+    owed = radmin.get(f"/api/fines/member/{m_bing}").get_json()
+    target = next(i for i in owed["items"] if i["loan_id"] == loan_admin["id"])
+    over_pay = radmin.post(
+        "/api/fines/collect",
+        json={"member_id": m_bing, "loan_id": loan_admin["id"], "amount": round(target["outstanding"] + 5, 2)},
+    )
+    check("馆员代收金额不得超过应缴（422）", over_pay.status_code == 422, over_pay.get_json())
+    zero_pay = radmin.post("/api/fines/collect", json={"member_id": m_bing, "loan_id": loan_admin["id"], "amount": 0})
+    check("馆员代收金额必须大于 0（400）", zero_pay.status_code == 400, zero_pay.get_json())
+    no_loan = radmin.post("/api/fines/collect", json={"member_id": m_bing})
+    check("馆员代收缺少借阅记录时 400", no_loan.status_code == 400, no_loan.get_json())
+    ok_pay = radmin.post("/api/fines/collect", json={"member_id": m_bing, "loan_id": loan_admin["id"]})
+    check(
+        "馆员代收（金额缺省=结清该笔）成功",
+        ok_pay.status_code == 200 and abs(ok_pay.get_json()["amount"] - target["outstanding"]) < 1e-6,
+        ok_pay.get_json(),
+    )
+    left = radmin.get(f"/api/fines/member/{m_bing}").get_json()
+    check("代收后该笔结清", all(i["loan_id"] != loan_admin["id"] for i in left["items"]), left.get("total_outstanding"))
+
+    waived = radmin.post("/api/fines/waive", json={"member_id": m_bing, "loan_id": loan_wv["id"]})
+    check("馆员可减免滞纳金", waived.status_code == 200 and waived.get_json()["kind"] == "waiver", waived.get_json())
+    left = radmin.get(f"/api/fines/member/{m_bing}").get_json()
+    check("减免后该笔同样结清", all(i["loan_id"] != loan_wv["id"] for i in left["items"]), left.get("total_outstanding"))
+    check("全部结清后汇总待缴为 0", left["total_outstanding"] == 0, left.get("total_outstanding"))
+
+    # 缴费流水（关键字同样跨表 JOIN）
+    pays = radmin.get("/api/fines", query_string={"page_size": 100}).get_json()
+    check("馆员可查看缴费流水", pays["total"] >= 3, pays.get("total"))
+    check(
+        "流水汇总与明细逐笔相加一致",
+        abs(pays["totals"]["paid"] - round(sum(i["amount"] for i in pays["items"] if i["kind"] == "payment"), 2)) < 1e-6,
+        pays.get("totals"),
+    )
+    kw_pay_book = radmin.get("/api/fines", query_string={"keyword": "代收", "page_size": 100}).get_json()
+    check(
+        "缴费流水按书名过滤（覆盖计数路径的 JOIN）",
+        kw_pay_book["total"] >= 1 and all("代收" in i["book_title"] for i in kw_pay_book["items"]),
+        kw_pay_book.get("total"),
+    )
+    check(
+        "过滤后的汇总只统计命中记录",
+        abs(kw_pay_book["totals"]["paid"] - round(sum(i["amount"] for i in kw_pay_book["items"] if i["kind"] == "payment"), 2)) < 1e-6,
+        kw_pay_book.get("totals"),
+    )
+    kw_pay_member = radmin.get("/api/fines", query_string={"keyword": "预约测试甲", "page_size": 100}).get_json()
+    check(
+        "缴费流水按读者姓名过滤",
+        kw_pay_member["total"] >= 1 and all(i["member_name"] == "预约测试甲" for i in kw_pay_member["items"]),
+        kw_pay_member.get("total"),
+    )
+    kw_kind = radmin.get("/api/fines", query_string={"kind": "waiver", "page_size": 100}).get_json()
+    check("缴费流水按类型过滤", kw_kind["total"] >= 1 and all(i["kind"] == "waiver" for i in kw_kind["items"]), kw_kind.get("total"))
+
+    # ---- 30.4 借书证挂失：与 borrowed 状态正交，闸门只拦写操作 ----
+    lost = c_yi.post("/api/reader/card/lost", headers=h_yi)
+    check("读者可自助挂失", lost.status_code == 200 and lost.get_json().get("card_lost") is True, lost.get_json())
+    check("挂失后回显挂失时间", bool(c_yi.get("/api/reader/me").get_json()["member"].get("lost_at")))
+
+    r_lost_borrow = radmin.post("/api/loans/borrow", json={"book_id": b_l2, "member_id": m_yi})
+    check("挂失后无法借书（422）", r_lost_borrow.status_code == 422, r_lost_borrow.get_json())
+    r_lost_renew = c_yi.post(f"/api/reader/loans/{loan_lost['id']}/renew", headers=h_yi)
+    check("挂失后无法自助续借（422）", r_lost_renew.status_code == 422, r_lost_renew.get_json())
+    r_lost_res = c_yi.post("/api/reader/reservations", json={"book_id": b_l3}, headers=h_yi)
+    check("挂失后无法预约（422）", r_lost_res.status_code == 422, r_lost_res.get_json())
+    check(
+        "挂失后仍可查看借阅记录",
+        c_yi.get("/api/reader/loans", query_string={"status": "all"}).status_code == 200,
+    )
+    mem_yi = radmin.get(f"/api/members/{m_yi}").get_json()
+    check("馆员端可见挂失标记", bool(mem_yi.get("card_lost")), mem_yi.get("card_lost"))
+
+    unlost = c_yi.post("/api/reader/card/unlost", headers=h_yi)
+    check("可自助解除挂失", unlost.status_code == 200 and unlost.get_json().get("card_lost") is False, unlost.get_json())
+    check("解除挂失后恢复借书", borrow(b_l2, m_yi).status_code in (200, 201))
+
+    # ---- 30.5 前端资源契约 ----
+    root_res = Path(__file__).resolve().parent.parent
+    html_admin = (root_res / "templates" / "index.html").read_text(encoding="utf-8")
+    js_admin = (root_res / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    html_reader = (root_res / "templates" / "reader.html").read_text(encoding="utf-8")
+    js_reader = (root_res / "static" / "js" / "reader.js").read_text(encoding="utf-8")
+    css_reader = (root_res / "static" / "css" / "reader.css").read_text(encoding="utf-8")
+    check(
+        "后台导航含「预约管理」入口且按权限隐藏",
+        'data-view="reservations"' in html_admin and 'data-permission="loan:write" hidden' in html_admin,
+    )
+    check(
+        "后台预约视图结构完整（页签 / 搜索 / 表格 / 分页）",
+        all(x in html_admin for x in ('id="view-reservations"', 'id="reservationTabs"', 'id="reservationKeyword"', 'id="reservationTable"', 'id="reservationPager"')),
+    )
+    check(
+        "后台预约视图调用预约接口并支持通知/取消",
+        "/api/reservations" in js_admin and "data-ready" in js_admin and "data-cancel" in js_admin,
+    )
+    check(
+        "后台预约关键字搜索已接入（防回归：计数路径需带 JOIN）",
+        "keyword: s.keyword" in js_admin and "loadReservations" in js_admin,
+    )
+    check(
+        "读者门户含我的预约 / 预约图书 / 滞纳金 / 挂失四块",
+        all(
+            x in html_reader
+            for x in ('id="reservationBody"', 'id="reserveSearchForm"', 'id="fineBody"', 'id="payAllBtn"', 'id="lostBtn"', 'id="unlostBtn"')
+        ),
+    )
+    check(
+        "读者门户调用预约 / 缴费 / 挂失接口",
+        all(
+            x in js_reader
+            for x in ("/api/reader/reservations", "/api/reader/fines/pay", "/api/reader/card/lost", "/api/reader/card/unlost")
+        ),
+    )
+    check("挂失横幅有独立样式", "reader-lost" in css_reader or "lost-banner" in css_reader)
+    check(
+        "读者端预约支持取消、缴费支持一次结清",
+        "data-cancel-res" in js_reader and 'all: true' in js_reader,
+    )
+
     print(f"\n{'=' * 46}\n结果：{PASSED} 项通过，{FAILED} 项失败\n{'=' * 46}")
     return 0 if FAILED == 0 else 1
 
