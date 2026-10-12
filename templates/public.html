@@ -21,14 +21,20 @@
       </a>
       <nav class="site-nav">
         <a href="#search">馆藏检索</a>
+        <a href="#noticeBoard">公告</a>
         <a href="#recommend">馆藏推荐</a>
+        <a href="#locationBoard">馆藏分布</a>
         <a href="#rules">借阅规则</a>
         <a href="#about">关于本馆</a>
       </nav>
-      <!-- 全站唯一登录入口：右上角按钮，点击弹出登录框 -->
-      <button class="btn btn-primary header-login" id="headerLoginBtn" type="button">
-        <span class="lock">🔐</span> 登录
-      </button>
+      <!-- 免登录的三个自助入口：办证预登记、借阅速查、登录 -->
+      <div class="header-actions">
+        <button class="btn btn-outline header-sub" id="applyCardBtn" type="button">在线办证</button>
+        <button class="btn btn-outline header-sub" id="quickCheckBtn" type="button">借阅速查</button>
+        <button class="btn btn-primary header-login" id="headerLoginBtn" type="button">
+          <span class="lock">🔐</span> 登录
+        </button>
+      </div>
     </div>
   </header>
 
@@ -54,8 +60,15 @@
 
         <div class="chips" id="quickChips"></div>
 
+        <div class="hero-cta">
+          <button class="btn btn-primary" id="heroApplyBtn" type="button">在线办证预登记</button>
+          <button class="btn btn-outline" id="heroQuickBtn" type="button">免登录查在借</button>
+        </div>
+
         <ul class="hero-points">
           <li><b>免登录检索</b>馆藏与在架状态随时可查</li>
+          <li><b>在线办证</b>先提交资料，到馆核验后领证</li>
+          <li><b>借阅速查</b>凭证号与密码看应还与欠费</li>
           <li><b>右上角登录</b>读者看在借续借，馆员进后台</li>
         </ul>
       </div>
@@ -64,10 +77,19 @@
 
   <section class="wrap statbar" id="statBar"></section>
 
+  <section class="wrap section" id="noticeBoard">
+    <div class="section-head">
+      <h2>公告</h2>
+      <span class="section-note" id="noticeSummary">最新通知与开馆安排</span>
+    </div>
+    <div class="notice-list" id="noticeList"></div>
+  </section>
+
   <section class="wrap section" id="search">
     <div class="section-head">
       <h2>检索结果</h2>
       <span class="section-note" id="searchSummary">输入关键词开始检索</span>
+      <button class="link-btn" id="clearLocationBtn" type="button" hidden>清除位置筛选</button>
     </div>
     <div class="card" id="searchCard">
       <div class="empty-state" id="searchEmpty">
@@ -106,6 +128,14 @@
     <div class="rule-grid" id="ruleGrid"></div>
   </section>
 
+  <section class="wrap section" id="locationBoard">
+    <div class="section-head">
+      <h2>馆藏分布</h2>
+      <span class="section-note">按馆藏位置浏览，点击即可查看该位置的全部图书</span>
+    </div>
+    <div class="location-grid" id="locationGrid"></div>
+  </section>
+
   <section class="wrap section" id="about">
     <div class="about">
       <div class="about-text">
@@ -121,7 +151,7 @@
           无论读者还是馆员，都必须登录才能进入各自的工作台。
         </p>
         <ul class="about-list">
-          <li><b>开馆时间</b>周一至周日 09:00 – 21:00（法定节假日以公告为准）</li>
+          <li><b>开馆时间</b><span id="aboutHours">周一至周日 09:00 – 21:00（法定节假日以公告为准）</span></li>
           <li><b>服务电话</b>0571-8888 6666</li>
           <li><b>馆舍地址</b>星海市文汇区书香路 18 号</li>
         </ul>
@@ -136,6 +166,7 @@
         </ol>
         <div class="about-actions">
           <a class="btn btn-primary" href="#login" data-open-login>前往登录</a>
+          <button class="btn btn-outline" id="aboutApplyBtn" type="button">在线办证</button>
         </div>
       </div>
     </div>
@@ -160,6 +191,82 @@
         <button class="bk-modal-close" id="bookModalClose" aria-label="关闭">✕</button>
       </div>
       <div class="bk-modal-body" id="bookModalBody"></div>
+    </div>
+  </div>
+
+  <!-- 在线办证预登记：免登录提交，馆员审核后到馆领证 -->
+  <div class="bk-modal-layer" id="applyModal" hidden>
+    <div class="bk-modal pk-modal" role="dialog" aria-modal="true" aria-labelledby="applyModalTitle">
+      <div class="bk-modal-head">
+        <h3 id="applyModalTitle">在线办证预登记</h3>
+        <button class="bk-modal-close" id="applyModalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="bk-modal-body">
+        <p class="pk-sub">提交资料后由馆员核验，通过后请携带本人证件到馆领取读者证与初始密码。</p>
+
+        <div class="pk-tabs" role="tablist">
+          <button type="button" class="pk-tab is-active" data-pk-tab="form">填写申请</button>
+          <button type="button" class="pk-tab" data-pk-tab="lookup">查询进度</button>
+        </div>
+
+        <form id="applyForm" novalidate>
+          <div class="pk-grid">
+            <div class="field"><label for="applyName">姓名<span class="req">*</span></label>
+              <input id="applyName" name="name" autocomplete="name" /></div>
+            <div class="field"><label for="applyPhone">手机号<span class="req">*</span></label>
+              <input id="applyPhone" name="phone" autocomplete="tel" placeholder="手机号可作登录账号" /></div>
+            <div class="field"><label for="applyEmail">邮箱</label>
+              <input id="applyEmail" name="email" autocomplete="email" /></div>
+            <div class="field"><label for="applyMemberType">读者类型</label>
+              <select id="applyMemberType" name="member_type"></select></div>
+            <div class="field"><label for="applyIdType">证件类型</label>
+              <select id="applyIdType" name="id_type"></select></div>
+            <div class="field"><label for="applyIdTail">证件号后 4 位</label>
+              <input id="applyIdTail" name="id_tail" maxlength="4" placeholder="到馆核验时需出示原件" /></div>
+            <div class="field full"><label for="applyNote">备注</label>
+              <textarea id="applyNote" name="note" rows="2" placeholder="例如：主要想借计算机类图书"></textarea></div>
+          </div>
+          <div class="pk-error" id="applyError" hidden></div>
+          <button class="btn btn-primary btn-block" type="submit" id="applySubmitBtn">提交申请</button>
+        </form>
+
+        <form id="lookupForm" novalidate hidden>
+          <div class="field"><label for="lookupCode">申请编号<span class="req">*</span></label>
+            <input id="lookupCode" name="code" placeholder="AC20261011-XXXXXX" /></div>
+          <div class="field"><label for="lookupPhone">手机号<span class="req">*</span></label>
+            <input id="lookupPhone" name="phone" autocomplete="tel" /></div>
+          <div class="pk-error" id="lookupError" hidden></div>
+          <button class="btn btn-primary btn-block" type="submit" id="lookupSubmitBtn">查询进度</button>
+        </form>
+
+        <div class="pk-result" id="applyResult" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 免登录借阅速查 -->
+  <div class="bk-modal-layer" id="quickModal" hidden>
+    <div class="bk-modal pk-modal" role="dialog" aria-modal="true" aria-labelledby="quickModalTitle">
+      <div class="bk-modal-head">
+        <h3 id="quickModalTitle">借阅速查</h3>
+        <button class="bk-modal-close" id="quickModalClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="bk-modal-body">
+        <p class="pk-sub">凭借书证号（或手机号）与密码查看在借数量、最近应还日期与待缴滞纳金。查询不会登录，也不会改动任何数据。</p>
+        <form id="quickForm" novalidate>
+          <div class="field"><label for="quickAccount">借书证号 / 手机号</label>
+            <input id="quickAccount" name="account" autocomplete="username" /></div>
+          <div class="field"><label for="quickPassword">密码</label>
+            <div class="pw-wrap">
+              <input id="quickPassword" name="password" type="password" autocomplete="current-password" />
+              <button type="button" class="pw-toggle" id="quickPwToggle" aria-label="显示密码">显示</button>
+            </div>
+          </div>
+          <div class="pk-error" id="quickError" hidden></div>
+          <button class="btn btn-primary btn-block" type="submit" id="quickSubmitBtn">查询</button>
+        </form>
+        <div class="pk-result" id="quickResult" hidden></div>
+      </div>
     </div>
   </div>
 

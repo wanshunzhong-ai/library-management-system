@@ -20,13 +20,13 @@ def _operator() -> str:
 
 
 @bp.get("")
-@require_permission("loan:write")
+@require_permission("loan:read")
 def list_payments():
     return jsonify(service.list_payments(request.args.to_dict(flat=True)))
 
 
 @bp.get("/member/<int:member_id>")
-@require_permission("loan:write")
+@require_permission("loan:read")
 def member_outstanding(member_id: int):
     return jsonify(service.member_outstanding(member_id))
 

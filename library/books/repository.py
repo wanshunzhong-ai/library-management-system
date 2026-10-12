@@ -96,6 +96,66 @@ def insert(payload: Mapping[str, Any]) -> int:
     )
 
 
+def insert_conn(conn, payload: Mapping[str, Any]) -> int:
+    """用**调用方的连接**插入图书（跨模块联动用，如采编验收时新建书目）。
+
+    ``db.execute`` 自带事务，在外层 ``BEGIN IMMEDIATE`` 里调用会中途提交外层事务；
+    凡是「验收单回写 + 建书 + 加册」这类跨表写操作都必须走这个入口。
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO books (isbn, barcode, title, author, publisher, category, publish_year,
+                           location, description, total_copies, available_copies)
+        VALUES (:isbn, :barcode, :title, :author, :publisher, :category, :publish_year,
+                :location, :description, :total_copies, :available_copies)
+        """,
+        dict(payload),
+    )
+    try:
+        return int(cur.lastrowid or 0)
+    finally:
+        cur.close()
+
+
+def set_barcode_conn(conn, book_id: int, code: str) -> None:
+    cur = conn.execute(
+        "UPDATE books SET barcode = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [code, book_id],
+    )
+    cur.close()
+
+
+def add_copies_conn(conn, book_id: int, copies: int) -> int:
+    """在调用方事务内加册：总册数与可借数同步 +N（新增复本默认全部在架）。"""
+    cur = conn.execute(
+        "UPDATE books SET total_copies = total_copies + ?, "
+        "       available_copies = available_copies + ?, "
+        "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [copies, copies, book_id],
+    )
+    try:
+        return max(0, int(cur.rowcount or 0))
+    finally:
+        cur.close()
+
+
+def get_conn(conn, book_id: int) -> dict[str, Any] | None:
+    cur = conn.execute(f"SELECT {_COLUMNS} FROM books WHERE id = ?", [book_id])
+    try:
+        row = cur.fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        cur.close()
+
+
+def exists_barcode_conn(conn, code: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM books WHERE barcode = ? LIMIT 1", [code])
+    try:
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
+
+
 def update(book_id: int, payload: Mapping[str, Any]) -> None:
     data = dict(payload)
     data["id"] = book_id

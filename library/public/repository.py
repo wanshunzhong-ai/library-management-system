@@ -31,6 +31,15 @@ def _build_filters(filters: Mapping[str, Any]) -> tuple[str, list[Any]]:
         clauses.append("category = ?")
         params.append(category)
 
+    # 馆藏分布导览：点某个位置就把它下面的书筛出来
+    location = (filters.get("location") or "").strip()
+    if location:
+        if location == "__none__":
+            clauses.append("(location IS NULL OR location = '')")
+        else:
+            clauses.append("location = ?")
+            params.append(location)
+
     if filters.get("available_only"):
         clauses.append("available_copies > 0")
 
@@ -103,6 +112,45 @@ def categories(limit: int = 12) -> list[dict[str, Any]]:
 
 def reader_count() -> int:
     return int(db.query_scalar("SELECT COUNT(*) FROM members") or 0)
+
+
+def locations(limit: int = 40) -> list[dict[str, Any]]:
+    """馆藏分布：按位置聚合种数 / 册数 / 可借册数 / 涉及分类。
+
+    位置是自由文本字段（历史数据可能为空），空位置单独作为一项「待分配」返回，
+    让读者知道还有多少书没标架位，而不是把它们藏起来。
+    """
+    rows = db.query_all(
+        """
+        SELECT CASE WHEN location IS NULL OR location = '' THEN '' ELSE location END AS location,
+               COUNT(*)                                     AS titles,
+               COALESCE(SUM(total_copies), 0)               AS copies,
+               COALESCE(SUM(available_copies), 0)           AS available_copies,
+               COUNT(DISTINCT category)                     AS category_count,
+               GROUP_CONCAT(DISTINCT category)              AS category_names
+          FROM books
+         WHERE total_copies > 0
+         GROUP BY CASE WHEN location IS NULL OR location = '' THEN '' ELSE location END
+         ORDER BY (location = '') ASC, copies DESC, location ASC
+         LIMIT ?
+        """,
+        [limit],
+    )
+    for row in rows:
+        names = [n for n in str(row.get("category_names") or "").split(",") if n]
+        row["categories"] = names[:4]
+        row["pending"] = not bool(row["location"])
+    return rows
+
+
+def location_names() -> list[str]:
+    """已登记的位置清单（供检索下拉与位置反查校验）。"""
+    rows = db.query_all(
+        "SELECT DISTINCT location FROM books "
+        " WHERE total_copies > 0 AND location IS NOT NULL AND location <> '' "
+        " ORDER BY location"
+    )
+    return [str(r["location"]) for r in rows]
 
 
 def active_reader_count() -> int:

@@ -175,3 +175,283 @@
   .lost-banner .btn { margin-left: 0; }
 }
 
+/* ================================================================
+ * 第 10 批：强制改密 / 消息中心 / 我的书架 / 评价 / 荐购 / 资料变更 / 电子借书证
+ * ================================================================ */
+
+/* ---------- 强制改密遮罩 ---------- */
+/* 这是「不可跳过」的安全闸门：不提供关闭按钮，也没有点击遮罩关闭 */
+.pw-gate {
+  position: fixed; inset: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  background: rgba(15, 23, 41, .62);
+  backdrop-filter: blur(3px);
+  overflow-y: auto;
+}
+.pw-gate-card {
+  width: 100%; max-width: 460px;
+  background: var(--surface); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); padding: 24px 26px 20px;
+  animation: pgIn .22s ease-out;
+}
+@keyframes pgIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.pw-gate-card .pg-badge {
+  display: inline-block; background: var(--warn-soft); color: var(--warn);
+  border-radius: 20px; padding: 2px 11px; font-size: 12px; font-weight: 600;
+}
+.pw-gate-card h2 { font-size: 19px; margin: 10px 0 8px; }
+.pw-gate-card .pg-lead { font-size: 13px; color: var(--text-soft); line-height: 1.85; margin-bottom: 16px; }
+.pw-gate-card .pg-lead strong { color: var(--text); }
+.pw-gate-card .field { margin-bottom: 12px; }
+.pw-gate-card .btn-primary { width: 100%; }
+.pw-gate-card .pg-logout {
+  display: block; width: 100%; margin-top: 12px; padding: 8px;
+  border: 0; background: transparent; color: var(--muted);
+  font-size: 12.5px; cursor: pointer;
+}
+.pw-gate-card .pg-logout:hover { color: var(--primary); text-decoration: underline; }
+body.gate-open { overflow: hidden; }
+
+/* ---------- 顶栏消息铃铛 ---------- */
+.bell-btn {
+  position: relative; border: 1px solid var(--border-strong); background: var(--surface);
+  border-radius: var(--radius-sm); padding: 5px 9px; cursor: pointer;
+  line-height: 1; transition: border-color .14s, background .14s;
+}
+.bell-btn:hover { border-color: var(--primary); background: var(--primary-soft); }
+.bell-ico { font-size: 15px; }
+.bell-badge {
+  position: absolute; top: -6px; right: -6px;
+  min-width: 17px; height: 17px; padding: 0 4px;
+  background: var(--danger); color: #fff; border-radius: 9px;
+  font-size: 11px; font-weight: 600; line-height: 17px; text-align: center;
+}
+
+/* ---------- 消息中心 ---------- */
+.notify-list { display: flex; flex-direction: column; }
+.notify-item {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 13px 18px; border-bottom: 1px solid var(--border);
+  cursor: default; transition: background .14s;
+}
+.notify-item:last-child { border-bottom: 0; }
+.notify-item:hover { background: #fbfcfe; }
+.notify-item.is-unread { background: var(--primary-soft); }
+.notify-item.is-unread:hover { background: #e2edff; }
+.nt-ico { font-size: 17px; flex: 0 0 auto; line-height: 1.4; }
+.nt-main { flex: 1; min-width: 0; }
+.nt-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.nt-kind { font-size: 12px; color: var(--text-soft); background: var(--surface-alt); border-radius: 5px; padding: 1px 7px; }
+.nt-dot { font-size: 11px; color: #fff; background: var(--primary); border-radius: 20px; padding: 1px 7px; }
+.nt-time { font-size: 12px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+.nt-title { font-weight: 600; font-size: 13.5px; margin-top: 5px; }
+.nt-body { font-size: 12.5px; color: var(--text-soft); margin-top: 3px; line-height: 1.75; }
+.nt-actions { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
+.notify-list .empty-state { border-bottom: 0; }
+
+/* ---------- 我的书架 ---------- */
+.shelf-add { padding: 14px 18px 8px; border-bottom: 1px dashed var(--border); }
+.shelf-add form { display: flex; gap: 8px; }
+.shelf-add input {
+  flex: 1; min-width: 0; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); padding: 9px 12px; background: var(--surface);
+}
+.shelf-add input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.shelf-candidates { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.shelf-hint { font-size: 12.5px; color: var(--muted); padding: 4px 0; }
+.shelf-cand {
+  display: flex; align-items: center; gap: 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 12px;
+}
+.shelf-cand .scc-main { flex: 1; min-width: 0; }
+.shelf-cand .scc-title { font-weight: 600; font-size: 13.5px; }
+.shelf-cand .scc-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.shelf-grid {
+  display: grid; gap: 12px; padding: 16px 18px;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+}
+.shelf-grid .empty-state { grid-column: 1 / -1; }
+.shelf-card {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 13px 14px; display: flex; flex-direction: column; gap: 5px;
+  background: var(--surface); transition: border-color .14s, box-shadow .14s;
+}
+.shelf-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow); }
+.shelf-card .sc-head { display: flex; align-items: flex-start; gap: 8px; }
+.shelf-card .sc-title { font-weight: 600; font-size: 13.5px; flex: 1; min-width: 0; }
+.shelf-card .sc-sub { font-size: 12px; color: var(--muted); }
+.shelf-card .sc-rating { font-size: 12px; margin-top: 1px; }
+.shelf-card .sc-note {
+  font-size: 12px; color: var(--text-soft); background: var(--surface-alt);
+  border-radius: 6px; padding: 5px 8px; margin-top: 3px;
+}
+.shelf-card .sc-foot {
+  display: flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.shelf-card .sc-time { font-size: 11.5px; color: var(--muted); margin-right: auto; }
+
+/* ---------- 评价 ---------- */
+.reviewable-list { display: flex; flex-direction: column; max-height: 420px; overflow-y: auto; }
+.reviewable-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 18px; border-bottom: 1px solid var(--border);
+}
+.reviewable-item:last-child { border-bottom: 0; }
+.reviewable-item .rvi-main { flex: 1; min-width: 0; }
+.reviewable-item .rvi-title { font-weight: 600; font-size: 13.5px; }
+.reviewable-item .rvi-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.my-review-list { display: flex; flex-direction: column; max-height: 420px; overflow-y: auto; }
+.my-review { padding: 12px 18px; border-bottom: 1px solid var(--border); }
+.my-review:last-child { border-bottom: 0; }
+.my-review .mr-head { display: flex; align-items: center; gap: 8px; }
+.my-review .mr-title { font-weight: 600; font-size: 13.5px; flex: 1; min-width: 0; }
+.my-review .mr-stars { margin-top: 4px; }
+.my-review .mr-text { font-size: 12.5px; color: var(--text-soft); margin-top: 5px; line-height: 1.75; }
+.my-review .mr-text.mr-empty { color: var(--muted); font-style: italic; }
+.my-review .mr-foot {
+  display: flex; align-items: center; gap: 8px; margin-top: 8px;
+  font-size: 11.5px; color: var(--muted);
+}
+.my-review .mr-foot .row-actions { margin-left: auto; }
+
+/* ---------- 荐购 / 资料变更 ---------- */
+.request-list { display: flex; flex-direction: column; border-top: 1px dashed var(--border); }
+.request-item { padding: 12px 18px; border-bottom: 1px solid var(--border); }
+.request-item:last-child { border-bottom: 0; }
+.request-item .ri-head { display: flex; align-items: flex-start; gap: 8px; }
+.request-item .ri-title { font-weight: 600; font-size: 13.5px; flex: 1; min-width: 0; }
+.request-item .ri-sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.request-item .ri-text { font-size: 12.5px; color: var(--text-soft); margin-top: 4px; line-height: 1.7; }
+.request-item .ri-reply {
+  font-size: 12.5px; color: var(--ok); background: var(--ok-soft);
+  border-radius: 6px; padding: 5px 9px; margin-top: 6px; line-height: 1.7;
+}
+.request-item .ri-foot { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+.request-list .req-empty, .req-empty { padding: 16px 18px; font-size: 12.5px; color: var(--muted); }
+.field .pr-current { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* ---------- 预约取书倒计时 ---------- */
+.hold-note { font-size: 12px; color: var(--ok); margin-top: 3px; font-weight: 500; }
+.hold-note.is-urgent { color: var(--danger); }
+.hero-chips .chip.is-ok { background: rgba(52,211,153,.22); border-color: rgba(52,211,153,.5); }
+
+/* ---------- 电子借书证 ---------- */
+.e-card {
+  margin: 16px 18px; border-radius: 14px; overflow: hidden;
+  background: linear-gradient(135deg, #1f4fb8, #2f6feb 58%, #5b9bff);
+  color: #fff; box-shadow: var(--shadow);
+}
+.ec-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 20px 10px;
+}
+.ec-lib { font-weight: 650; font-size: 15px; }
+.ec-kind { font-size: 11px; letter-spacing: 2px; color: rgba(255,255,255,.72); }
+.ec-body {
+  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+  padding: 4px 20px 18px;
+}
+.ec-fields { display: flex; flex-direction: column; gap: 7px; flex: 1; min-width: 180px; }
+.ec-field { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+.ec-field span { color: rgba(255,255,255,.75); min-width: 34px; }
+.ec-field b { font-size: 15px; font-weight: 650; }
+.ec-codes { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.ec-qr, .ec-barcode {
+  background: #fff; border-radius: 10px; padding: 8px;
+  display: flex; align-items: center; justify-content: center;
+}
+.ec-qr svg { width: 108px; height: 108px; display: block; }
+.ec-barcode svg { width: 210px; height: auto; display: block; }
+.ec-fallback { color: #7a5a12; font-size: 12px; padding: 6px; }
+.ec-foot {
+  padding: 10px 20px 14px; font-size: 12px;
+  color: rgba(255,255,255,.82); border-top: 1px solid rgba(255,255,255,.2);
+}
+
+/* ---------- 弹窗 ---------- */
+.dlg-mask {
+  position: fixed; inset: 0; z-index: 180;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; background: rgba(15, 23, 41, .5);
+  animation: dlgFade .14s ease-out;
+}
+.dlg-mask.out { opacity: 0; transition: opacity .16s; }
+@keyframes dlgFade { from { opacity: 0; } to { opacity: 1; } }
+.dlg {
+  width: 100%; max-width: 470px; max-height: 88vh; overflow-y: auto;
+  background: var(--surface); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); animation: pgIn .18s ease-out;
+}
+.dlg-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 15px 18px; border-bottom: 1px solid var(--border);
+}
+.dlg-head h3 { font-size: 15.5px; flex: 1; min-width: 0; }
+.dlg-x {
+  border: 0; background: transparent; color: var(--muted);
+  font-size: 15px; cursor: pointer; padding: 2px 6px; border-radius: 6px;
+}
+.dlg-x:hover { background: var(--surface-alt); color: var(--text); }
+.dlg-body { padding: 16px 18px; }
+.dlg-body .field + .field { margin-top: 13px; }
+.dlg-foot {
+  display: flex; justify-content: flex-end; gap: 10px;
+  padding: 13px 18px; border-top: 1px solid var(--border); background: var(--surface-alt);
+}
+.dlg-hint { font-size: 12px; color: var(--muted); margin-top: 12px; line-height: 1.7; }
+body.dlg-open { overflow: hidden; }
+
+/* 星级选择 */
+.star-picker { display: flex; align-items: center; gap: 3px; }
+.sp-star {
+  border: 0; background: transparent; cursor: pointer; padding: 0 1px;
+  font-size: 25px; line-height: 1; color: #d8dee9; transition: color .12s, transform .12s;
+}
+.sp-star:hover { transform: scale(1.1); }
+.sp-star.on { color: #f5a524; }
+.sp-label { font-size: 12.5px; color: var(--muted); margin-left: 8px; }
+
+/* 改约弹窗内的搜索 */
+.rebook-search { display: flex; gap: 8px; }
+.rebook-search input {
+  flex: 1; min-width: 0; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); padding: 8px 11px;
+}
+.rebook-search input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.rebook-results {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 12px;
+  max-height: 320px; overflow-y: auto;
+}
+
+/* 评分样式与门户保持同一套观感（读者页也复用它） */
+.stars { display: inline-flex; align-items: center; gap: 1px; vertical-align: middle; }
+.stars i { font-style: normal; color: #d8dee9; font-size: 14px; line-height: 1; }
+.stars i.on { color: #f5a524; }
+.stars-sm i { font-size: 12.5px; }
+.rating-num { font-size: 12.5px; font-weight: 600; margin-left: 5px; }
+.rating-cnt { font-size: 12px; color: var(--muted); }
+
+@media (max-width: 720px) {
+  .shelf-add form { flex-wrap: wrap; }
+  .shelf-add input { flex: 1 1 100%; }
+  .ec-body { flex-direction: column; align-items: flex-start; }
+  .nt-time { margin-left: 0; }
+  .nt-actions { flex-direction: row; }
+}
+
+/* 打印 / 另存为 PDF：只留借书证，其余内容一律不出现在纸上 */
+@media print {
+  .reader-head, .reader-main > *:not(#sec-card), .toast-layer, .dlg-mask, .pw-gate { display: none !important; }
+  .reader-main { padding: 0; }
+  #sec-card { border: 0; box-shadow: none; }
+  #sec-card .panel-head .btn { display: none; }
+  .e-card { box-shadow: none; }
+  .ec-qr svg { width: 132px; height: 132px; }
+  body { background: #fff; }
+}
+

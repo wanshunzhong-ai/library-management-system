@@ -147,6 +147,20 @@ def cancel_reservation(res_id: int):
     return jsonify(result)
 
 
+@bp.post("/api/reader/reservations/<int:res_id>/rebook")
+def rebook_reservation(res_id: int):
+    member = _require_reader()
+    result = service.rebook_reservation(member, res_id, _body())
+    new = result.get("reservation") or {}
+    audit.log(
+        "reservation.rebook",
+        entity="reservation",
+        entity_id=result.get("closed_id"),
+        summary=f"读者改约：原预约 #{result.get('closed_id')} → 《{new.get('book_title') or ''}》",
+    )
+    return jsonify(result)
+
+
 # ---------------------------------------------------------------- 滞纳金
 
 
@@ -167,6 +181,136 @@ def pay_fines():
         summary=f"读者自助缴纳滞纳金 ¥{float(result.get('paid_total') or 0):.2f}（{result.get('count')} 笔）",
     )
     return jsonify(result)
+
+
+# ---------------------------------------------------------------- 我的书架（收藏）
+
+
+@bp.get("/api/reader/favorites")
+def my_favorites():
+    member = _require_reader()
+    return jsonify(service.list_my_favorites(member, request.args.to_dict(flat=True)))
+
+
+@bp.post("/api/reader/favorites")
+def add_favorite():
+    member = _require_reader()
+    result = service.add_favorite(member, _body())
+    audit.log(
+        "favorite.add",
+        entity="favorite",
+        entity_id=result.get("id"),
+        summary=f"读者收藏《{result.get('book_title') or ''}》",
+    )
+    return jsonify(result), 201
+
+
+@bp.put("/api/reader/favorites/<int:favorite_id>")
+def update_favorite(favorite_id: int):
+    member = _require_reader()
+    return jsonify(service.update_favorite(member, favorite_id, _body()))
+
+
+@bp.delete("/api/reader/favorites/<int:favorite_id>")
+def remove_favorite(favorite_id: int):
+    member = _require_reader()
+    result = service.remove_favorite(member, favorite_id)
+    audit.log(
+        "favorite.remove",
+        entity="favorite",
+        entity_id=favorite_id,
+        summary=f"读者取消收藏《{result.get('book_title') or ''}》",
+    )
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------- 图书评价
+
+
+@bp.get("/api/reader/reviews")
+def my_reviews():
+    member = _require_reader()
+    return jsonify(service.list_my_reviews(member, request.args.to_dict(flat=True)))
+
+
+@bp.get("/api/reader/reviews/pending")
+def reviewable_books():
+    """待评价：借过（已归还）但还没评的书。"""
+    member = _require_reader()
+    return jsonify(service.list_my_reviewable(member))
+
+
+@bp.post("/api/reader/reviews")
+def submit_review():
+    member = _require_reader()
+    result = service.submit_review(member, _body())
+    review = result.get("review") or {}
+    audit.log(
+        "review.write",
+        entity="review",
+        entity_id=review.get("id"),
+        summary=f"读者评价《{review.get('book_title') or ''}》{review.get('rating')} 星",
+    )
+    return jsonify(result), 201 if result.get("created") else 200
+
+
+@bp.delete("/api/reader/reviews/<int:review_id>")
+def delete_review(review_id: int):
+    member = _require_reader()
+    result = service.delete_my_review(member, review_id)
+    audit.log("review.delete", entity="review", entity_id=review_id, summary="读者删除自己的图书评价")
+    return jsonify(result)
+
+
+@bp.get("/api/reader/books/<int:book_id>/reviews")
+def book_reviews(book_id: int):
+    """读者视角看某本书的评价（含「我评过没有」「我有没有资格评」）。"""
+    member = _require_reader()
+    return jsonify(service.book_reviews(member, book_id, request.args.to_dict(flat=True)))
+
+
+# ---------------------------------------------------------------- 荐购登记
+
+
+@bp.get("/api/reader/book-requests")
+def my_book_requests():
+    member = _require_reader()
+    return jsonify(service.list_my_book_requests(member, request.args.to_dict(flat=True)))
+
+
+@bp.post("/api/reader/book-requests")
+def submit_book_request():
+    member = _require_reader()
+    result = service.submit_book_request(member, _body())
+    audit.log(
+        "book_request.submit",
+        entity="book_request",
+        entity_id=result.get("id"),
+        summary=f"读者登记荐购《{result.get('title') or ''}》",
+    )
+    return jsonify(result), 201
+
+
+# ---------------------------------------------------------------- 资料变更申请
+
+
+@bp.get("/api/reader/profile-requests")
+def my_profile_requests():
+    member = _require_reader()
+    return jsonify(service.list_my_profile_requests(member, request.args.to_dict(flat=True)))
+
+
+@bp.post("/api/reader/profile-requests")
+def submit_profile_request():
+    member = _require_reader()
+    result = service.submit_profile_request(member, _body())
+    audit.log(
+        "profile_request.submit",
+        entity="profile_request",
+        entity_id=result.get("id"),
+        summary=f"读者申请变更{result.get('field_label') or ''}（读者 #{member['id']}）",
+    )
+    return jsonify(result), 201
 
 
 # ---------------------------------------------------------------- 借书证挂失

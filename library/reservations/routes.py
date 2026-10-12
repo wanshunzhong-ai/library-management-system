@@ -20,6 +20,7 @@ def _summary(payload, verb: str) -> str:
 
 
 @bp.get("")
+@require_permission("loan:read")
 def list_reservations():
     return jsonify(service.list_reservations(request.args.to_dict(flat=True)))
 

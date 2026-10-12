@@ -36,30 +36,57 @@ ROLE_LABELS: dict[str, str] = {
 
 # 能力 → 中文名（授权界面与错误提示都用它）
 CAPABILITY_LABELS: dict[str, str] = {
+    "book:read": "查看图书与馆藏",
     "book:write": "图书编目与上下架",
+    "member:read": "查看读者档案",
     "member:write": "读者档案维护",
+    "loan:read": "查看借阅 / 预约 / 罚金",
     "loan:write": "借书 / 还书 / 续借",
+    "announcement:read": "查看公告",
+    "announcement:write": "公告与开馆时间维护",
     "dashboard:read": "查看概览报表",
+    "approval:approve": "审批罚金减免",
     "account:manage": "后台账号与授权管理",
     "log:read": "查看操作日志",
 }
 
 ALL_CAPABILITIES: tuple[str, ...] = (
+    "book:read",
     "book:write",
+    "member:read",
     "member:write",
+    "loan:read",
     "loan:write",
+    "announcement:read",
+    "announcement:write",
     "dashboard:read",
+    "approval:approve",
     "account:manage",
     "log:read",
 )
 
 # 角色 → 能力集。**改动这里就等于改动权限边界**，请连同 README 的权限矩阵一起改。
+#
+# 读 / 写分开声明的意义：日常角色（管理员、流通馆员）读写全给；
+# 将来若加「只读审计 / 财务」岗位，只授 ``*:read`` 不授写能力即可——
+# 各模块的列表 / 详情 GET 接口都已挂 ``*:read``，写接口挂 ``*:write``，互不牵连。
 ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     # 系统管理员：全权，含账号与日志
     ROLE_ADMIN: frozenset(ALL_CAPABILITIES),
-    # 流通馆员：日常业务全包（编目、办证、借还续），但**不碰账号、不看全量日志**
+    # 流通馆员：日常业务全包（编目、办证、借还续、公告发布），
+    # 但**不碰账号、不看全量日志**
     ROLE_LIBRARIAN: frozenset(
-        {"book:write", "member:write", "loan:write", "dashboard:read"}
+        {
+            "book:read",
+            "book:write",
+            "member:read",
+            "member:write",
+            "loan:read",
+            "loan:write",
+            "announcement:read",
+            "announcement:write",
+            "dashboard:read",
+        }
     ),
 }
 

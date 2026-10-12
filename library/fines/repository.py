@@ -44,6 +44,33 @@ def insert_payment(
     )
 
 
+def insert_payment_conn(
+    conn,
+    *,
+    member_id: int,
+    loan_id: int,
+    amount: float,
+    kind: str = "payment",
+    method: str = "",
+    note: str = "",
+    operator: str = "",
+) -> int:
+    """用**调用方的连接**写入（跨模块联动用）。
+
+    ``db.execute`` 自带事务，在外层 ``BEGIN IMMEDIATE`` 里调用会中途提交外层事务、
+    悄悄破坏原子性；凡是「赔偿结案同时减免罚金」这类跨表写操作都必须走这个入口。
+    """
+    cur = conn.execute(
+        "INSERT INTO fine_payments (member_id, loan_id, amount, kind, method, note, operator) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [member_id, loan_id, round(float(amount), 2), kind, method, note, operator],
+    )
+    try:
+        return int(cur.lastrowid or 0)
+    finally:
+        cur.close()
+
+
 def settled_by_loan(member_id: int) -> dict[int, float]:
     """该读者每笔借阅已结算（缴纳 + 减免）的金额。"""
     rows = db.query_all(

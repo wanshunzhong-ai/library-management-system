@@ -91,6 +91,51 @@ def optional_int(
     return number
 
 
+def require_float(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    label: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = _get(payload, key)
+    if value is None or value == "":
+        raise ValidationError(f"{label}不能为空", details={"field": key})
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label}必须是数字", details={"field": key}) from exc
+    if minimum is not None and number < minimum:
+        raise ValidationError(f"{label}不能小于 {minimum}", details={"field": key})
+    if maximum is not None and number > maximum:
+        raise ValidationError(f"{label}不能大于 {maximum}", details={"field": key})
+    return number
+
+
+def optional_float(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    label: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    default: float = 0.0,
+) -> float:
+    value = _get(payload, key)
+    if value is None or value == "":
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{label}必须是数字", details={"field": key}) from exc
+    if minimum is not None and number < minimum:
+        raise ValidationError(f"{label}不能小于 {minimum}", details={"field": key})
+    if maximum is not None and number > maximum:
+        raise ValidationError(f"{label}不能大于 {maximum}", details={"field": key})
+    return number
+
+
 def optional_email(payload: Mapping[str, Any], key: str, *, label: str = "邮箱") -> str:
     value = _get(payload, key, "")
     if not value:

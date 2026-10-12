@@ -31,11 +31,13 @@ def _batch_summary(_kwargs: Mapping[str, Any], payload: Mapping[str, Any] | None
 
 
 @bp.get("")
+@require_permission("loan:read")
 def list_loans():
     return jsonify(service.list_loans(request.args.to_dict(flat=True)))
 
 
 @bp.get("/<int:loan_id>")
+@require_permission("loan:read")
 def get_loan(loan_id: int):
     return jsonify(service.get_loan(loan_id))
 
@@ -53,6 +55,21 @@ def borrow():
 def return_batch():
     """批量还书：一次归还多册，逐条返回结果（部分失败不影响其余）。"""
     return jsonify(service.return_batch(request.get_json(silent=True) or {}))
+
+
+@bp.post("/notify-overdue")
+@require_permission("loan:write")
+@audit.audit_action(
+    "loan.notify_overdue",
+    entity="loan",
+    summary_of=lambda _kw, p: (
+        f"批量催还：处理 {int((p or {}).get('requested') or 0)} 条，"
+        f"新发送 {int((p or {}).get('sent') or 0)} 条"
+    ),
+)
+def notify_overdue():
+    """批量催还：给逾期读者发站内通知（幂等，同一笔借阅的同一次逾期只提醒一次）。"""
+    return jsonify(service.notify_overdue(request.get_json(silent=True) or {}))
 
 
 @bp.post("/<int:loan_id>/return")

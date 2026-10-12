@@ -8,8 +8,8 @@ from library import db
 
 # 对外返回的字段（绝不包含 password_hash）
 _PUBLIC_COLUMNS = (
-    "id, card_no, name, phone, email, member_type, status, max_borrow, "
-    "card_lost, lost_at, last_login_at, created_at, updated_at"
+    "id, card_no, name, phone, email, email_subscribed, member_type, status, max_borrow, "
+    "card_lost, lost_at, must_change_password, last_login_at, created_at, updated_at"
 )
 # 鉴权专用：额外带出密码哈希，仅 reader 登录流程内部使用
 _AUTH_COLUMNS = f"{_PUBLIC_COLUMNS}, password_hash"
@@ -114,8 +114,12 @@ def exists_card(card_no: str, *, exclude_id: int | None = None) -> bool:
 def insert(payload: Mapping[str, Any]) -> int:
     return db.execute(
         """
-        INSERT INTO members (card_no, name, phone, email, member_type, status, max_borrow, password_hash)
-        VALUES (:card_no, :name, :phone, :email, :member_type, :status, :max_borrow, :password_hash)
+        INSERT INTO members
+            (card_no, name, phone, email, member_type, status, max_borrow,
+             password_hash, must_change_password)
+        VALUES
+            (:card_no, :name, :phone, :email, :member_type, :status, :max_borrow,
+             :password_hash, :must_change_password)
         """,
         dict(payload),
     )
@@ -140,11 +144,18 @@ def delete(member_id: int) -> None:
     db.execute("DELETE FROM members WHERE id = ?", [member_id])
 
 
-def update_contact(member_id: int, phone: str, email: str) -> None:
-    """读者自助修改联系方式（姓名 / 证号 / 可借上限仍由管理员维护）。"""
+def update_contact(member_id: int, phone: str, email: str, *, email_subscribed: bool | None = None) -> None:
+    """读者自助修改联系方式与邮件订阅开关（姓名 / 证号 / 可借上限仍由管理员维护）。"""
+    if email_subscribed is None:
+        db.execute(
+            "UPDATE members SET phone = ?, email = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+            [phone, email, member_id],
+        )
+        return
     db.execute(
-        "UPDATE members SET phone = ?, email = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
-        [phone, email, member_id],
+        "UPDATE members SET phone = ?, email = ?, email_subscribed = ?, "
+        "updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [phone, email, 1 if email_subscribed else 0, member_id],
     )
 
 
@@ -152,6 +163,35 @@ def update_password_hash(member_id: int, password_hash: str) -> None:
     db.execute(
         "UPDATE members SET password_hash = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
         [password_hash, member_id],
+    )
+
+
+def set_must_change_password(member_id: int, flag: bool) -> None:
+    """置 / 清「首次登录必须改密」标记。
+
+    置位发生在馆员建号、重置密码、办证发证三处——这三处的口令都是「证号后 6 位」
+    这种可从证号直接推出来的弱口令。读者自己改密成功后清零。
+    """
+    db.execute(
+        "UPDATE members SET must_change_password = ?, "
+        "       updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [1 if flag else 0, member_id],
+    )
+
+
+def set_name(member_id: int, name: str) -> None:
+    """馆员审核通过「姓名变更申请」后回写姓名。"""
+    db.execute(
+        "UPDATE members SET name = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [name, member_id],
+    )
+
+
+def set_member_type(member_id: int, member_type: str) -> None:
+    """馆员审核通过「读者类型变更申请」后回写类型。"""
+    db.execute(
+        "UPDATE members SET member_type = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+        [member_type, member_id],
     )
 
 

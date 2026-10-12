@@ -70,6 +70,20 @@ def _normalize(payload: Mapping[str, Any], *, default_max_borrow: int) -> dict[s
     }
 
 
+def validate_member(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """只做规范化与唯一性校验，**不写库**（批量导入预览用）。
+
+    与 ``create_member`` 共用 ``_normalize`` 与 ``ensure_identifier_available``，
+    保证预览结论与真实导入结论一致。
+    """
+    data = _normalize(payload, default_max_borrow=get_config().default_max_borrow)
+    if repo.exists_card(data["card_no"]):
+        raise ConflictError(f"读者证号 {data['card_no']} 已存在", details={"field": "card_no"})
+    ensure_identifier_available(data["card_no"], field="card_no", label="读者证号")
+    ensure_identifier_available(data["phone"], field="phone", label="手机号")
+    return data
+
+
 def list_members(query: Mapping[str, Any]) -> dict[str, Any]:
     page, size = pagination(query)
     filters = {
@@ -106,9 +120,11 @@ def create_member(payload: Mapping[str, Any]) -> dict[str, Any]:
     ensure_identifier_available(data["card_no"], field="card_no", label="读者证号")
     ensure_identifier_available(data["phone"], field="phone", label="手机号")
 
-    # 新建读者即开通门户账号，初始密码为证号后 6 位
+    # 新建读者即开通门户账号，初始密码为证号后 6 位；同时置「首次登录必须改密」——
+    # 证号是顺序编号时，这串口令几乎等于公开信息，不能让它长期有效。
     plain_password = initial_password(data["card_no"])
     data["password_hash"] = hash_password(plain_password) if plain_password else ""
+    data["must_change_password"] = 1 if plain_password else 0
     member_id = repo.insert(data)
 
     member = get_member(member_id)
@@ -126,6 +142,8 @@ def reset_member_password(member_id: int) -> dict[str, Any]:
     if not plain:
         raise BusinessRuleError("该读者证号为空，无法生成初始密码")
     repo.update_password_hash(member_id, hash_password(plain))
+    # 重置后的口令同样是「证号后 6 位」，必须强制读者下次登录就改掉
+    repo.set_must_change_password(member_id, True)
     logger.info("重置读者密码", extra={"extra_fields": {"member_id": member_id, "card_no": member["card_no"]}})
     return {"member_id": member_id, "card_no": member["card_no"], "initial_password": plain}
 

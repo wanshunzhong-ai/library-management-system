@@ -190,11 +190,40 @@ class Config:
     fine_cap: float = 50.0
     # 受信反向代理（IP 或 CIDR）：只有这些来源的 X-Forwarded-For 才被采信
     trusted_proxies: tuple[str, ...] = ()
+    # 在线办证申请：同一来源在窗口期内的提交 / 查询次数上限（防刷）
+    apply_max_attempts: int = 10
+    apply_lock_minutes: int = 10
+    # 预约到书后的取书保留天数：超期未取自动让位给下一位排队者
+    reservation_hold_days: int = 3
+    # 到期前提醒的提前天数：距应还日期不足这个天数时给读者发一条站内通知
+    notify_due_soon_days: int = 3
+    # 预约过期释放的后台扫描间隔（秒）。0 表示不启动后台线程，只保留
+    # 「有人打开页面时惰性扫描」的行为——单元测试即用 0，避免每个用例都起线程。
+    sweep_interval_seconds: int = 600
+    # 读者附件（照片 / 证件）上传目录与单文件大小上限
+    upload_dir: str = ""
+    upload_max_mb: int = 4
+    # 邮件出站渠道（SMTP）。host 留空 = 未配置邮件渠道：出站队列照常入队，
+    # 但停在 pending 不投递；配置后由后台扫描线程 / 手动触发补发。
+    smtp_host: str = ""
+    smtp_port: int = 0            # 0 = 按 secure 自动选择（SSL 465 / TLS 587）
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""           # 发件人地址，留空取 smtp_user
+    smtp_secure: str = "auto"     # auto / ssl / tls / none
+    # 罚金减免审批阈值（元）。0 = 不启用审批（减免直接生效，维持原有流程）；
+    # >0 后单笔减免金额 ≥ 阈值自动转「待审批」，需系统管理员批准才生效。
+    approval_waiver_threshold: float = 0.0
+    # 备份目录：留空取数据库同级的 backups/
+    backup_dir: str = ""
 
 
 def load_config() -> Config:
     db_path = _env_str("LIBRARY_DB_PATH", str(BASE_DIR / "data" / "library.db"))
     debug = _env_bool("LIBRARY_DEBUG", False)
+    smtp_secure = _env_str("LIBRARY_SMTP_SECURE", "auto").strip().lower()
+    if smtp_secure not in ("auto", "ssl", "tls", "none"):
+        raise ConfigError(f"LIBRARY_SMTP_SECURE 只支持 auto/ssl/tls/none，当前值 {smtp_secure!r}")
     return Config(
         db_path=db_path,
         host=_env_str("LIBRARY_HOST", "127.0.0.1"),
@@ -222,6 +251,26 @@ def load_config() -> Config:
         login_lock_minutes=_env_int("LIBRARY_LOGIN_LOCK_MINUTES", 5, minimum=1, maximum=1440),
         cookie_secure=_env_bool("LIBRARY_COOKIE_SECURE", False),
         trusted_proxies=_env_list("LIBRARY_TRUSTED_PROXIES"),
+        apply_max_attempts=_env_int("LIBRARY_APPLY_MAX_ATTEMPTS", 10, minimum=1, maximum=1000),
+        apply_lock_minutes=_env_int("LIBRARY_APPLY_LOCK_MINUTES", 10, minimum=1, maximum=1440),
+        reservation_hold_days=_env_int("LIBRARY_RESERVATION_HOLD_DAYS", 3, minimum=1, maximum=90),
+        notify_due_soon_days=_env_int("LIBRARY_NOTIFY_DUE_SOON_DAYS", 3, minimum=0, maximum=90),
+        sweep_interval_seconds=_env_int(
+            "LIBRARY_SWEEP_INTERVAL_SECONDS", 600, minimum=0, maximum=86400
+        ),
+        # 默认与数据库同目录，便于随数据一起备份 / 迁移
+        upload_dir=_env_str(
+            "LIBRARY_UPLOAD_DIR", str(Path(db_path).expanduser().parent / "uploads")
+        ),
+        upload_max_mb=_env_int("LIBRARY_UPLOAD_MAX_MB", 4, minimum=1, maximum=50),
+        smtp_host=_env_str("LIBRARY_SMTP_HOST", ""),
+        smtp_port=_env_int("LIBRARY_SMTP_PORT", 0, minimum=0, maximum=65535),
+        smtp_user=_env_str("LIBRARY_SMTP_USER", ""),
+        smtp_password=_env_str("LIBRARY_SMTP_PASSWORD", ""),
+        smtp_from=_env_str("LIBRARY_SMTP_FROM", ""),
+        smtp_secure=_env_str("LIBRARY_SMTP_SECURE", "auto").strip().lower(),
+        approval_waiver_threshold=_env_float("LIBRARY_APPROVAL_WAIVER_THRESHOLD", 0.0, minimum=0),
+        backup_dir=_env_str("LIBRARY_BACKUP_DIR", str(Path(db_path).expanduser().parent / "backups")),
     )
 
 

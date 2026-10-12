@@ -93,6 +93,13 @@ def count(filters: Mapping[str, Any]) -> int:
     return int(db.query_scalar(sql, params) or 0)
 
 
+def list_overdue(filters: Mapping[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    """当前逾期未还的借阅（按应还日期升序），供批量催还使用。"""
+    where, params = _build_filters({**dict(filters), "status": "overdue"})
+    sql = _SELECT + where + " ORDER BY l.due_at ASC, l.id ASC LIMIT ?"
+    return db.query_all(sql, [*params, limit])
+
+
 def list_loans(filters: Mapping[str, Any], *, limit: int, offset: int) -> list[dict[str, Any]]:
     where, params = _build_filters(filters)
     order = db.order_clause(filters, _SORT_COLUMNS, _DEFAULT_ORDER)

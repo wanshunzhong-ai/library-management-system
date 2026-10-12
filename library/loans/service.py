@@ -27,6 +27,9 @@ STATUS_LABELS = {"borrowed": "在借", "overdue": "逾期", "returned": "已归�
 # 单次批量还书上限：柜面一次性归还的合理规模，也避免一次请求长时间占用写锁
 MAX_BATCH_RETURN = 200
 
+# 单次批量催还上限：一次请求里写几百条通知已经足够，再大就该分批了
+MAX_NOTIFY_BATCH = 500
+
 
 def _decorate(row: Mapping[str, Any]) -> dict[str, Any]:
     """补齐派生字段：状态、逾期天数、罚金。
@@ -278,6 +281,105 @@ def renew(loan_id: int) -> dict[str, Any]:
         if cur.rowcount == 0:
             raise BusinessRuleError(f"续借次数已达上限（{cfg.max_renew} 次）")
     return get_loan(loan_id)
+
+
+def notify_overdue(payload: Mapping[str, Any], *, operator: str = "") -> dict[str, Any]:
+    """批量催还：给当前逾期的读者各发一条站内通知。
+
+    **幂等**：通知的 ``dedupe_key`` 与惰性扫描用的是同一个键
+    （``overdue:loan:<id>:<应还日期>``），所以反复点「批量催还」不会给读者刷屏，
+    续借（应还日期变化）后才会再发一条——这与读者中心看到的逾期提醒是同一份消息。
+
+    支持两种入口：显式传 ``ids``（勾选若干条），或按 ``keyword`` / ``member_id``
+    / ``book_id`` 过滤当前所有逾期记录（柜面上「催这一批」更常见）。
+    """
+    raw_ids = payload.get("ids")
+    targets: list[dict[str, Any]] = []
+
+    if isinstance(raw_ids, (list, tuple)) and raw_ids:
+        seen: set[int] = set()
+        for value in raw_ids:
+            try:
+                loan_id = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(f"借阅记录 ID 必须是整数：{value!r}", details={"field": "ids"}) from exc
+            if loan_id <= 0:
+                raise ValidationError(f"借阅记录 ID 非法：{loan_id}", details={"field": "ids"})
+            if loan_id in seen:
+                continue
+            seen.add(loan_id)
+            if len(seen) > MAX_NOTIFY_BATCH:
+                raise ValidationError(
+                    f"单次最多催还 {MAX_NOTIFY_BATCH} 条，请分批处理", details={"field": "ids"}
+                )
+            row = repo.get(loan_id)
+            if row is None:
+                raise NotFoundError(f"借阅记录 #{loan_id} 不存在")
+            if row.get("returned_at"):
+                raise BusinessRuleError(f"借阅记录 #{loan_id} 已归还，无需催还")
+            if int(fine.overdue_days(row.get("due_at"))) <= 0:
+                raise BusinessRuleError(f"借阅记录 #{loan_id} 尚未逾期，无需催还")
+            targets.append(row)
+    else:
+        filters = {
+            "keyword": payload.get("keyword", ""),
+            "member_id": payload.get("member_id") or 0,
+            "book_id": payload.get("book_id") or 0,
+        }
+        targets = repo.list_overdue(filters, limit=MAX_NOTIFY_BATCH)
+        if not targets:
+            return {
+                "requested": 0,
+                "sent": 0,
+                "skipped": 0,
+                "members": 0,
+                "message": "当前筛选条件下没有逾期未还的记录",
+            }
+
+    from library.notifications import service as notify_service  # noqa: PLC0415
+
+    sent = 0
+    skipped = 0
+    members: set[int] = set()
+    for row in targets:
+        loan_id = int(row["id"])
+        member_id = int(row["member_id"])
+        due_day = str(row.get("due_at") or "")[:10]
+        overdue_days = int(fine.overdue_days(row.get("due_at")))
+        title = str(row.get("book_title") or "")
+        new_id = notify_service.notify(
+            member_id,
+            "overdue",
+            f"《{title}》已超过应还日期",
+            body=(
+                f"应还日期 {due_day}，已逾期 {overdue_days} 天。"
+                "逾期期间会持续产生滞纳金，请尽快归还或到馆办理续借。"
+            ),
+            link_view="loans",
+            ref_type="loan",
+            ref_id=loan_id,
+            dedupe_key=f"overdue:loan:{loan_id}:{due_day}",
+        )
+        if new_id:
+            sent += 1
+        else:
+            skipped += 1
+        members.add(member_id)
+
+    logger.info(
+        "批量催还",
+        extra={"extra_fields": {"requested": len(targets), "sent": sent, "operator": operator}},
+    )
+    return {
+        "requested": len(targets),
+        "sent": sent,
+        "skipped": skipped,
+        "members": len(members),
+        "message": (
+            f"共处理 {len(targets)} 条逾期记录，新发送 {sent} 条催还通知"
+            + (f"，{skipped} 条此前已发过（同一笔借阅的同一次逾期只提醒一次）" if skipped else "")
+        ),
+    }
 
 
 def _require_id(payload: Mapping[str, Any], key: str, *, label: str) -> int:

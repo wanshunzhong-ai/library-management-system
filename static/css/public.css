@@ -11,13 +11,16 @@
 .site-nav { display: flex; gap: 22px; margin-left: 8px; }
 .site-nav a { color: var(--text-soft); font-size: 14px; padding: 4px 0; border-bottom: 2px solid transparent; transition: color .14s, border-color .14s; }
 .site-nav a:hover { color: var(--primary); border-bottom-color: var(--primary); }
-/* 头部右侧：统一登录入口 */
-.header-login { margin-left: auto; padding: 7px 16px; font-weight: 500; }
+/* 头部右侧：免登录自助入口 + 统一登录 */
+.header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.header-sub { padding: 6px 12px; font-size: 13px; }
+.header-login { padding: 7px 16px; font-weight: 500; }
 .header-login .lock { font-size: 12px; }
 
 @media (max-width: 900px) {
   .site-nav { display: none; }
   .header-login { padding: 6px 12px; font-size: 13px; }
+  .header-sub { display: none; }
 }
 
 /* Hero：整幅留给馆藏检索，登录统一走右上角弹窗 */
@@ -259,3 +262,138 @@
   .bk-detail { flex-direction: column-reverse; }
   .bk-code-box { width: 100%; }
 }
+
+/* ============ 公告栏 ============ */
+.notice-list { display: flex; flex-direction: column; gap: 12px; }
+.notice {
+  background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--primary);
+  border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px 18px;
+}
+.notice.is-important { border-left-color: var(--warn); background: linear-gradient(90deg, var(--warn-soft) 0%, var(--surface) 60%); }
+.notice-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.notice-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.notice-time { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.notice-body { margin: 8px 0 0; color: var(--text-soft); font-size: 13.5px; line-height: 1.75; white-space: pre-wrap; }
+@media (max-width: 640px) {
+  .notice-time { margin-left: 0; width: 100%; }
+}
+
+/* ============ 馆藏分布 ============ */
+.location-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 12px; }
+.loc-card {
+  text-align: left; cursor: pointer; font: inherit; color: inherit;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+.loc-card:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(20, 32, 55, .12); border-color: var(--primary); }
+.loc-card:focus-visible { outline: 3px solid var(--primary-soft); outline-offset: 2px; border-color: var(--primary); }
+.loc-card.is-ok { border-top: 3px solid var(--ok); }
+.loc-name { font-size: 14.5px; font-weight: 650; }
+.loc-v { font-size: 21px; font-weight: 650; color: var(--primary); line-height: 1.2; }
+.loc-card.is-ok .loc-v { color: var(--ok); }
+.loc-v small { font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+.loc-sub { color: var(--muted); font-size: 12px; }
+.loc-cats { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.loc-cat { background: var(--surface-alt); border: 1px solid var(--border); border-radius: 20px; padding: 1px 8px; font-size: 11.5px; color: var(--text-soft); }
+
+/* 区块标题里的行内操作 */
+.link-btn {
+  border: 0; background: transparent; color: var(--primary); font-size: 12.5px;
+  cursor: pointer; padding: 2px 4px; text-decoration: underline; text-underline-offset: 3px;
+}
+.link-btn[hidden] { display: none; }
+
+/* ============ Hero 快捷入口 ============ */
+.hero-cta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+
+/* ============ 在线办证 / 借阅速查 弹窗 ============ */
+/* public.html 不加载后台样式，这里补齐表单所需的公共类 */
+.field.full { grid-column: 1 / -1; }
+.field label .req { color: var(--danger); margin-left: 2px; }
+.field select, .field textarea {
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  padding: 9px 11px; font: inherit; font-size: 13.5px; color: var(--text);
+  background: var(--surface); outline: none; transition: border-color .14s, box-shadow .14s;
+  width: 100%; resize: vertical;
+}
+.field select:focus, .field textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.field .tip { font-size: 11.5px; color: var(--muted); }
+
+.pk-modal { width: 480px; max-width: calc(100vw - 32px); }
+.pk-sub { margin: 0 0 14px; color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+.pk-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.pk-tab {
+  border: 0; background: transparent; cursor: pointer; font: inherit; font-size: 13.5px;
+  padding: 7px 12px; color: var(--text-soft); border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.pk-tab:hover { color: var(--primary); }
+.pk-tab.is-active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+.pk-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pk-grid .field { margin-bottom: 2px; }
+.pk-error {
+  margin: 12px 0; background: var(--danger-soft); border: 1px solid #f2c9c7;
+  border-radius: var(--radius-sm); padding: 9px 12px; font-size: 12.5px; color: var(--danger);
+}
+.pk-error[hidden] { display: none; }
+.pk-result[hidden] { display: none; }
+.pk-result { margin-top: 16px; }
+.pk-ok {
+  background: var(--ok-soft); border: 1px solid #c6e6d4; border-radius: var(--radius-sm);
+  padding: 12px 14px; font-size: 13px; color: var(--text);
+}
+.pk-ok b { display: block; margin-bottom: 4px; font-size: 13.5px; }
+.pk-ok p { margin: 4px 0 0; color: var(--text-soft); font-size: 12.5px; line-height: 1.7; }
+.pk-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 1px 7px; letter-spacing: .4px; color: var(--text);
+}
+.pk-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px; }
+.pk-stats > div {
+  background: var(--surface-alt); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 9px 6px; text-align: center;
+}
+.pk-stats b { display: block; font-size: 16px; font-weight: 650; }
+.pk-stats span { color: var(--muted); font-size: 11.5px; }
+.pk-next { margin-top: 10px; color: var(--text-soft); font-size: 12.5px; }
+.pk-table-wrap { margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.pk-table { font-size: 12.5px; }
+.pk-table th, .pk-table td { padding: 7px 10px; }
+.pk-empty { text-align: center; color: var(--muted); }
+.pk-hint { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+
+@media (max-width: 640px) {
+  .pk-grid { grid-template-columns: 1fr; }
+  .pk-stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ============ 读者评分与评价（第 10 批） ============ */
+/* 星级：门户 / 读者端 / 后台共用一套观感 */
+.stars { display: inline-flex; gap: 1px; vertical-align: middle; font-size: 14px; line-height: 1; }
+.stars i { font-style: normal; color: #d8dee9; }
+.stars i.on { color: #f5a524; }
+.stars-sm { font-size: 12px; }
+.rating-num { margin-left: 4px; font-weight: 650; font-size: 12.5px; }
+.rating-cnt { color: var(--muted); font-size: 11.5px; }
+
+.book-card .bc-rating { margin-top: 2px; }
+.book-card .bc-rating .stars { font-size: 11.5px; }
+
+/* 详情弹窗里的评价区 */
+.bk-reviews { margin-top: 16px; border-top: 1px dashed var(--border); padding-top: 12px; }
+.bk-reviews-head { font-size: 13px; font-weight: 650; margin-bottom: 8px; }
+.bk-reviews-body { display: flex; flex-direction: column; gap: 10px; }
+.rv-summary { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text-soft); font-size: 12.5px; }
+.rv-summary b { font-size: 15px; color: var(--text); }
+.rv-cnt { color: var(--muted); }
+.rv-item {
+  background: var(--surface-alt, #f7f9fd); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 9px 11px;
+}
+.rv-top { display: flex; align-items: center; gap: 8px; }
+.rv-who { font-weight: 600; font-size: 12.5px; }
+.rv-time { margin-left: auto; color: var(--muted); font-size: 11.5px; }
+.rv-text { margin: 6px 0 0; font-size: 12.5px; line-height: 1.7; color: var(--text-soft); white-space: pre-wrap; }
+.rv-text.is-empty { color: var(--muted); font-style: italic; }
+.rv-hint { color: var(--muted); font-size: 12.5px; line-height: 1.7; }

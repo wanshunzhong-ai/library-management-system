@@ -20,11 +20,21 @@
         <button class="nav-item is-active" data-view="dashboard"><span class="nav-ico">▦</span>概览</button>
         <button class="nav-item" data-view="books"><span class="nav-ico">▤</span>图书管理</button>
         <button class="nav-item" data-view="members"><span class="nav-ico">◍</span>读者管理</button>
+        <button class="nav-item" data-view="applications" data-permission="member:write" hidden><span class="nav-ico">✎</span>办证审核</button>
         <button class="nav-item" data-view="loans"><span class="nav-ico">⇄</span>借阅管理</button>
+        <button class="nav-item" data-view="fines" data-permission="loan:write" hidden><span class="nav-ico">¥</span>滞纳金管理</button>
         <button class="nav-item" data-view="reservations" data-permission="loan:write" hidden><span class="nav-ico">◷</span>预约管理</button>
+        <button class="nav-item" data-view="compensations" data-permission="loan:write" hidden><span class="nav-ico">✖</span>赔偿处理</button>
+        <button class="nav-item" data-view="stocktaking" data-permission="book:write" hidden><span class="nav-ico">☑</span>盘点</button>
+        <button class="nav-item" data-view="acquisitions" data-permission="book:write" hidden><span class="nav-ico">✚</span>采编验收</button>
+        <button class="nav-item" data-view="announcements" data-permission="announcement:write" hidden><span class="nav-ico">◔</span>公告管理</button>
+        <button class="nav-item" data-view="engagement" data-permission="member:write" hidden><span class="nav-ico">✪</span>读者互动<span class="nav-badge" id="engagementBadge" hidden>0</span></button>
+        <button class="nav-item" data-view="imports" data-permission="book:write" hidden><span class="nav-ico">⇪</span>批量导入</button>
         <!-- 系统管理：仅系统管理员可见（角色不足时保持 hidden，避免"点进去被拒"） -->
+        <button class="nav-item" data-view="approvals" data-permission="approval:approve" hidden><span class="nav-ico">✓</span>审批中心<span class="nav-badge" id="approvalBadge" hidden>0</span></button>
         <button class="nav-item" data-view="accounts" data-permission="account:manage" hidden><span class="nav-ico">⚙</span>账号管理</button>
         <button class="nav-item" data-view="logs" data-permission="log:read" hidden><span class="nav-ico">≡</span>操作日志</button>
+        <button class="nav-item" data-view="system" data-permission="account:manage" hidden><span class="nav-ico">⛭</span>系统维护</button>
       </nav>
       <div class="sidebar-foot" id="policyBox">
         <div class="policy-row"><span>借期</span><b id="policyDays">—</b></div>
@@ -135,6 +145,28 @@
         </div>
       </section>
 
+      <section class="view" id="view-applications" data-permission="member:write">
+        <div class="toolbar">
+          <div class="tabs" id="applicationTabs">
+            <button class="tab is-active" data-status="pending">待审核</button>
+            <button class="tab" data-status="approved">已通过</button>
+            <button class="tab" data-status="rejected">已驳回</button>
+            <button class="tab" data-status="">全部</button>
+          </div>
+          <div class="search">
+            <input id="applicationKeyword" type="search" placeholder="搜索姓名 / 手机号 / 申请编号 / 证号" />
+          </div>
+          <button class="btn ghost" id="applicationReset">重置</button>
+          <button class="btn ghost" id="applicationExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <span class="hint" id="applicationHint"></span>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="applicationTable"></table></div>
+          <div class="pager" id="applicationPager"></div>
+        </div>
+      </section>
+
       <section class="view" id="view-loans">
         <div class="toolbar">
           <div class="tabs" id="loanTabs">
@@ -148,6 +180,8 @@
           </div>
           <button class="btn ghost" id="loanReset">重置</button>
           <button class="btn ghost" id="loanExport">导出 CSV</button>
+          <button class="btn" id="loanNotifyOverdue" title="给当前逾期读者批量发送催还通知">批量催还</button>
+          <button class="btn" id="loanPrintOverdue" title="按当前逾期筛选打印催还单">打印催还单</button>
           <button class="btn" id="loanReturnBatch" disabled title="勾选下方未归还记录后一键归还">批量还书</button>
           <span class="sel-count" id="loanSelCount"></span>
           <div class="spacer"></div>
@@ -156,6 +190,132 @@
         <div class="card">
           <div class="table-scroll"><table class="table" id="loanTable"></table></div>
           <div class="pager" id="loanPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-fines" data-permission="loan:write">
+        <div class="toolbar">
+          <div class="tabs" id="fineTabs">
+            <button class="tab is-active" data-kind="">全部</button>
+            <button class="tab" data-kind="payment">已收取</button>
+            <button class="tab" data-kind="waiver">已减免</button>
+          </div>
+          <div class="search">
+            <input id="fineKeyword" type="search" placeholder="搜索读者 / 证号 / 书名 / 经办人" />
+          </div>
+          <button class="btn ghost" id="fineReset">重置</button>
+          <button class="btn ghost" id="fineExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="fineCollect">+ 代收 / 减免</button>
+        </div>
+        <div class="card">
+          <div class="sum-grid" id="fineSummary"></div>
+          <div class="table-scroll"><table class="table" id="fineTable"></table></div>
+          <div class="pager" id="finePager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-compensations" data-permission="loan:write">
+        <div class="toolbar">
+          <div class="tabs" id="compensationTabs">
+            <button class="tab is-active" data-status="pending">待结案</button>
+            <button class="tab" data-status="settled">已结案</button>
+            <button class="tab" data-status="cancelled">已注销</button>
+            <button class="tab" data-status="">全部</button>
+          </div>
+          <select id="compensationKind" class="select">
+            <option value="">全部类型</option>
+            <option value="lost">图书丢失</option>
+            <option value="damaged">图书损毁</option>
+          </select>
+          <div class="search">
+            <input id="compensationKeyword" type="search" placeholder="搜索读者 / 证号 / 书名 / 条码" />
+          </div>
+          <button class="btn ghost" id="compensationReset">重置</button>
+          <button class="btn ghost" id="compensationExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="compensationCreate">+ 登记赔偿</button>
+        </div>
+        <div class="card">
+          <div class="sum-grid" id="compensationSummary"></div>
+          <div class="table-scroll"><table class="table" id="compensationTable"></table></div>
+          <div class="pager" id="compensationPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-stocktaking" data-permission="book:write">
+        <div class="toolbar">
+          <div class="tabs" id="stocktakingTabs">
+            <button class="tab is-active" data-status="">全部</button>
+            <button class="tab" data-status="open">进行中</button>
+            <button class="tab" data-status="closed">已关闭</button>
+          </div>
+          <select id="stocktakingLocation" class="select"></select>
+          <div class="search">
+            <input id="stocktakingKeyword" type="search" placeholder="搜索单号 / 馆藏位置 / 经办人" />
+          </div>
+          <button class="btn ghost" id="stocktakingReset">重置</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="stocktakingCreate">+ 开启盘点单</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="stocktakingTable"></table></div>
+          <div class="pager" id="stocktakingPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-acquisitions" data-permission="book:write">
+        <div class="toolbar">
+          <div class="tabs" id="acquisitionTabs">
+            <button class="tab is-active" data-status="pending">待验收</button>
+            <button class="tab" data-status="accepted">已验收</button>
+            <button class="tab" data-status="rejected">已驳回</button>
+            <button class="tab" data-status="">全部</button>
+          </div>
+          <div class="search">
+            <input id="acquisitionKeyword" type="search" placeholder="搜索书名 / ISBN / 供应商" />
+          </div>
+          <button class="btn ghost" id="acquisitionReset">重置</button>
+          <button class="btn ghost" id="acquisitionExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="acquisitionCreate">+ 登记到货</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="acquisitionTable"></table></div>
+          <div class="pager" id="acquisitionPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-imports" data-permission="book:write">
+        <div class="toolbar">
+          <div class="tabs" id="importKindTabs">
+            <button class="tab is-active" data-kind="books">图书导入</button>
+            <button class="tab" data-kind="members" data-permission="member:write">读者导入</button>
+          </div>
+          <button class="btn ghost" id="importTemplate">下载模板</button>
+          <div class="spacer"></div>
+          <span class="hint" id="importHint"></span>
+        </div>
+        <div class="card">
+          <div class="import-panel">
+            <div class="field full">
+              <label for="importPaste">粘贴表格内容</label>
+              <textarea id="importPaste" rows="7" spellcheck="false"
+                placeholder="第一行必须是表头。可直接从 Excel / WPS 框选整块区域复制粘贴（Tab 分隔也能识别）。"></textarea>
+            </div>
+            <div class="import-actions">
+              <label class="btn ghost" for="importFile">选择文件（.csv / .xlsx）</label>
+              <input type="file" id="importFile" accept=".csv,.txt,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
+              <button class="btn" id="importClear" type="button">清空</button>
+              <div class="spacer"></div>
+              <button class="btn" id="importPreview" type="button">预览校验</button>
+              <button class="btn primary" id="importRun" type="button">开始导入</button>
+            </div>
+            <div class="import-tip" id="importTip"></div>
+          </div>
+          <div class="table-scroll" id="importResultWrap" hidden>
+            <table class="table" id="importResultTable"></table>
+          </div>
         </div>
       </section>
 
@@ -172,12 +332,65 @@
             <input id="reservationKeyword" type="search" placeholder="搜索书名 / 条码 / 读者 / 证号" />
           </div>
           <button class="btn ghost" id="reservationReset">重置</button>
+          <button class="btn ghost" id="reservationExport">导出 CSV</button>
           <div class="spacer"></div>
           <span class="hint" id="reservationHint"></span>
         </div>
         <div class="card">
           <div class="table-scroll"><table class="table" id="reservationTable"></table></div>
           <div class="pager" id="reservationPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-announcements" data-permission="announcement:write">
+        <div class="toolbar">
+          <div class="tabs" id="announcementTabs">
+            <button class="tab is-active" data-status="">全部</button>
+            <button class="tab" data-status="published">已发布</button>
+            <button class="tab" data-status="draft">草稿</button>
+            <button class="tab" data-status="archived">已下线</button>
+          </div>
+          <select id="announcementKind" class="select">
+            <option value="">全部类型</option>
+            <option value="notice">公告</option>
+            <option value="hours">开馆时间</option>
+          </select>
+          <div class="search">
+            <input id="announcementKeyword" type="search" placeholder="搜索标题 / 正文" />
+          </div>
+          <button class="btn ghost" id="announcementReset">重置</button>
+          <button class="btn ghost" id="announcementExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <button class="btn primary" id="announcementCreate">+ 新建公告</button>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="announcementTable"></table></div>
+          <div class="pager" id="announcementPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-engagement" data-permission="member:write">
+        <div class="toolbar">
+          <div class="tabs" id="engagementKindTabs">
+            <button class="tab is-active" data-kind="reviews">图书评价</button>
+            <button class="tab" data-kind="book-requests">荐购登记</button>
+            <button class="tab" data-kind="profile-requests">资料变更</button>
+          </div>
+          <div class="tabs" id="engagementStatusTabs"></div>
+          <div class="search">
+            <input id="engagementKeyword" type="search" placeholder="搜索书名 / 读者 / 内容" />
+          </div>
+          <button class="btn ghost" id="engagementReset">重置</button>
+          <button class="btn ghost" id="engagementExport">导出 CSV</button>
+          <div class="spacer"></div>
+          <span class="hint" id="engagementHint"></span>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="engagementTable"></table></div>
+          <div class="pager" id="engagementPager"></div>
+        </div>
+        <div class="card" id="engagementPendingCard">
+          <div class="pending-grid" id="engagementPending"></div>
         </div>
       </section>
 
@@ -213,12 +426,77 @@
             <option value="denied">已拦截</option>
           </select>
           <button class="btn ghost" id="logReset">重置</button>
+          <button class="btn ghost" id="logExport">导出 CSV</button>
           <div class="spacer"></div>
           <span class="hint" id="logHint"></span>
         </div>
         <div class="card">
           <div class="table-scroll"><table class="table" id="logTable"></table></div>
           <div class="pager" id="logPager"></div>
+        </div>
+      </section>      <section class="view" id="view-approvals" data-permission="approval:approve">
+        <div class="toolbar">
+          <div class="tabs" id="approvalTabs">
+            <button class="tab is-active" data-status="pending">待审批</button>
+            <button class="tab" data-status="approved">已通过</button>
+            <button class="tab" data-status="rejected">已驳回</button>
+            <button class="tab" data-status="">全部</button>
+          </div>
+          <div class="search">
+            <input id="approvalKeyword" type="search" placeholder="搜索读者 / 申请人 / 内容" />
+          </div>
+          <button class="btn ghost" id="approvalReset">重置</button>
+          <div class="spacer"></div>
+          <span class="hint" id="approvalHint"></span>
+        </div>
+        <div class="card">
+          <div class="table-scroll"><table class="table" id="approvalTable"></table></div>
+          <div class="pager" id="approvalPager"></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-system" data-permission="account:manage">
+        <div class="toolbar">
+          <div class="tabs" id="systemTabs">
+            <button class="tab is-active" data-pane="jobs">后台任务</button>
+            <button class="tab" data-pane="mail">邮件渠道</button>
+            <button class="tab" data-pane="backups">数据备份</button>
+          </div>
+          <button class="btn ghost" id="systemRefresh">刷新</button>
+          <div class="spacer"></div>
+          <span class="hint" id="systemHint"></span>
+        </div>
+
+        <div class="card" id="systemPaneJobs">
+          <div class="sum-grid" id="jobSummary"></div>
+          <div class="toolbar slim">
+            <button class="btn primary" id="jobRunNow">立即执行一轮</button>
+            <div class="spacer"></div>
+            <span class="hint" id="jobRunHint"></span>
+          </div>
+          <div class="table-scroll"><table class="table" id="jobTable"></table></div>
+        </div>
+
+        <div class="card" id="systemPaneMail" hidden>
+          <div class="sum-grid" id="mailSummary"></div>
+          <div class="import-actions">
+            <input id="mailTestTo" type="email" placeholder="收件邮箱（测试发信）" />
+            <button class="btn" id="mailTest" type="button">发送测试邮件</button>
+            <button class="btn ghost" id="mailRetry" type="button">重试失败邮件</button>
+            <div class="spacer"></div>
+            <span class="hint" id="mailHint"></span>
+          </div>
+          <div class="table-scroll"><table class="table" id="mailTable"></table></div>
+        </div>
+
+        <div class="card" id="systemPaneBackups" hidden>
+          <div class="toolbar slim">
+            <label class="check"><input type="checkbox" id="backupWithUploads" /> 连附件一起打包（zip）</label>
+            <button class="btn primary" id="backupCreate" type="button">立即备份</button>
+            <div class="spacer"></div>
+            <span class="hint" id="backupHint"></span>
+          </div>
+          <div class="table-scroll"><table class="table" id="backupTable"></table></div>
         </div>
       </section>
     </main>

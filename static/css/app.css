@@ -466,17 +466,184 @@ button, input, select, textarea { font: inherit; color: inherit; }
 @media print {
   body > *:not(#printLayer) { display: none !important; }
   body { background: #fff; }
-  /* 多份标签按行平铺，每张自己避免跨页断开 */
-  .print-layer { display: flex !important; flex-wrap: wrap; gap: 4mm; align-items: flex-start; padding: 12mm; }
+  /* 打印层同时承载「条码标签」与「借书凭证 / 催还单」：用 block 才能让凭证按页断开，
+     标签则改为 inline-block 自行平铺 —— 用 flex 会让 page-break-after 失效。 */
+  .print-layer { display: block !important; padding: 12mm; }
   .print-label {
     width: 62mm; padding: 5mm 4mm; border: 1px solid #111827; border-radius: 3mm;
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
     color: #111827; text-align: center; page-break-inside: avoid; break-inside: avoid;
     box-sizing: border-box;
+    display: inline-block; vertical-align: top; margin: 0 4mm 4mm 0;
   }
   .print-label .pl-lib { font-size: 10pt; font-weight: 600; letter-spacing: 1mm; margin-bottom: 2mm; }
   .print-label .pl-title { font-size: 11pt; font-weight: 600; line-height: 1.35; word-break: break-all; }
   .print-label .pl-sub { font-size: 8pt; color: #374151; margin: 1.5mm 0 3mm; }
   .print-label .pl-code svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
   .print-label .pl-isbn { font-size: 8pt; color: #4b5563; margin-top: 1.5mm; letter-spacing: .3mm; }
+}
+
+/* ================= 第 10 批：读者互动（评价 / 荐购 / 资料变更） ================= */
+
+/* 导航待处理角标 */
+.nav-item { position: relative; }
+.nav-badge {
+  position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  min-width: 18px; height: 18px; padding: 0 5px;
+  background: var(--danger); color: #fff; border-radius: 9px;
+  font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
+}
+.nav-item.is-active .nav-badge { box-shadow: 0 0 0 2px var(--primary-soft); }
+
+/* 待处理汇总小卡 */
+.pending-grid {
+  display: grid; gap: 12px; padding: 14px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.pending-item {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 12px 14px; background: var(--surface-alt);
+}
+.pending-item .p-label { font-size: 12.5px; color: var(--text-soft); }
+.pending-item .p-value { font-size: 24px; font-weight: 700; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.pending-item .p-hint { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* 星级展示（读者给图书打的 1–5 星） */
+.stars { display: inline-flex; align-items: center; gap: 1px; vertical-align: middle; }
+.stars i { font-style: normal; color: #d8dee9; font-size: 14px; line-height: 1; }
+.stars i.on { color: #f5a524; }
+
+/* 互动列表里的长文本 */
+#engagementTable td.wrap { max-width: 300px; }
+#engagementTable .title-cell strong { word-break: break-all; }
+
+/* ================= 第 11 批：流通馆员能力 ================= */
+
+/* 兼容早先写下的 .badge.success（其它地方用的是 .badge.ok，这里统一成同一个绿） */
+.badge.success { background: var(--ok-soft); color: var(--ok); }
+
+/* 操作列按钮多了要能折行，否则窄屏会把表格撑破 */
+.table .actions { flex-wrap: wrap; }
+
+/* ---------- 顶部汇总小卡（滞纳金 / 赔偿） ---------- */
+.sum-grid {
+  display: grid; gap: 12px; padding: 14px 16px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  border-bottom: 1px solid var(--border);
+}
+.sum-grid:empty { display: none; }
+.sum-grid.compact { padding: 0 0 12px; border-bottom: none; }
+.sum-item {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; background: var(--surface-alt);
+}
+.sum-item .s-label { font-size: 12.5px; color: var(--text-soft); display: block; }
+.sum-item .s-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; display: block; margin-top: 2px; }
+.sum-item .s-hint { font-size: 11.5px; color: var(--muted); display: block; margin-top: 2px; }
+.sum-item.is-ok .s-value { color: var(--ok); }
+.sum-item.is-warn .s-value { color: var(--warn); }
+.sum-item.is-danger .s-value { color: var(--danger); }
+.sum-item.is-info .s-value { color: var(--primary); }
+
+/* ---------- 读者选择器 ---------- */
+.pick-list {
+  margin-top: 10px; max-height: 300px; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface);
+}
+.pick-empty { padding: 18px; text-align: center; color: var(--muted); font-size: 13px; }
+.pick-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; padding: 10px 12px; border: none; background: transparent;
+  border-bottom: 1px solid var(--border); cursor: pointer; text-align: left;
+}
+.pick-item:last-child { border-bottom: none; }
+.pick-item:hover, .pick-item:focus-visible { background: var(--primary-soft); }
+.pick-item span { font-size: 12.5px; color: var(--text-soft); }
+
+/* ---------- 确认块（减免 / 注销 / 调账） ---------- */
+.confirm-block { padding: 4px 0 10px; }
+.confirm-block p { margin: 0 0 8px; }
+.confirm-amount { font-size: 30px; font-weight: 700; color: var(--danger); font-variant-numeric: tabular-nums; }
+.confirm-reason {
+  background: var(--surface-alt); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 8px 12px; font-size: 13px;
+}
+.confirm-warn { color: var(--text-soft); font-size: 12.5px; }
+
+/* ---------- 进度条（盘点） ---------- */
+.progress {
+  height: 6px; border-radius: 4px; background: #eef1f6; overflow: hidden; min-width: 72px;
+}
+.progress i { display: block; height: 100%; background: var(--primary); border-radius: 4px; }
+
+/* ---------- 盘点明细 ---------- */
+.toolbar.slim { padding: 0 0 10px; border-bottom: none; }
+.stk-scroll { max-height: 46vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.stk-input {
+  width: 72px; padding: 5px 8px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); text-align: right; font-variant-numeric: tabular-nums;
+}
+.stk-input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px var(--primary-soft); }
+
+/* ---------- 批量导入 ---------- */
+.import-panel { padding: 16px; }
+.import-panel textarea {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); resize: vertical; line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+}
+.import-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.import-tip {
+  margin-top: 10px; padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--surface-alt); border: 1px solid var(--border);
+  font-size: 13px; color: var(--text-soft); line-height: 1.6;
+}
+.import-tip.is-ok { background: var(--ok-soft); border-color: #bfe6cf; color: var(--ok); }
+.import-tip.is-warn { background: var(--warn-soft); border-color: #f0dcb4; color: var(--warn); }
+#importPaste { min-height: 132px; }
+#importResultWrap { max-height: 46vh; overflow: auto; }
+.table tr.row-bad td { background: var(--danger-soft); }
+.tag-inline {
+  display: inline-block; padding: 1px 6px; border-radius: 10px;
+  background: var(--primary-soft); color: var(--primary); font-size: 11.5px;
+}
+
+/* ---------- 读者附件 ---------- */
+.file-list { margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.file-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+}
+.file-item:last-child { border-bottom: none; }
+.fi-thumb {
+  width: 44px; height: 44px; border-radius: var(--radius-sm); object-fit: cover;
+  background: var(--surface-alt); border: 1px solid var(--border); flex: 0 0 44px;
+}
+.fi-thumb.is-doc { display: grid; place-items: center; font-size: 11px; font-weight: 700; color: var(--text-soft); }
+.fi-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.fi-main b { word-break: break-all; }
+.fi-kind { font-size: 11.5px; color: var(--primary); }
+.fi-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+
+/* ---------- 打印：借书凭证 / 催还单 ---------- */
+@media print {
+  .print-sheet {
+    padding: 12mm 10mm; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #111827; page-break-after: always; break-after: page;
+  }
+  .print-sheet:last-child { page-break-after: auto; break-after: auto; }
+  .ps-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    border-bottom: 2px solid #111827; padding-bottom: 4mm; margin-bottom: 6mm;
+  }
+  .ps-lib { font-size: 15pt; font-weight: 700; letter-spacing: 1mm; }
+  .ps-kind { font-size: 13pt; font-weight: 600; }
+  .ps-table { width: 100%; border-collapse: collapse; font-size: 11pt; }
+  .ps-table th, .ps-table td {
+    border: 1px solid #111827; padding: 3mm 4mm; text-align: left; vertical-align: top;
+  }
+  .ps-table th { width: 22mm; background: #f1f3f7; font-weight: 600; white-space: nowrap; }
+  .ps-table .ps-due { font-weight: 700; }
+  .ps-note { margin-top: 6mm; font-size: 10pt; line-height: 1.7; }
+  .ps-sign { margin-top: 14mm; display: flex; justify-content: space-between; font-size: 10.5pt; }
 }

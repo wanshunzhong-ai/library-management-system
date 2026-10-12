@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sqlite3
 import sys
@@ -44,6 +46,114 @@ def config_rejected(module) -> bool:
     except module.ConfigError:
         return True
     return False
+
+
+def with_ctx(app, func, *args, **kwargs):
+    """在应用上下文里调用 ``func``。
+
+    ``get_conn()`` 在应用上下文内走 ``flask.g``（按当前配置连库），在上下文外退化
+    为**线程级缓存连接**——本测试文件早前已建立过指向别的临时库的连接，因此凡是
+    直接调用后台扫描等「非请求路径」的逻辑，都必须像后台线程那样显式进上下文。
+    """
+    with app.app_context():
+        return func(*args, **kwargs)
+
+
+def librarian_client(app, username="smoke-librarian", password="librarian123"):
+    """建一个流通馆员账号并返回其登录后的客户端。
+
+    用于验证「馆员看不到管理员功能」这类**能力边界**断言——权限矩阵若被改错，
+    这里会立刻红。
+    """
+    from library.auth import passwords as auth_passwords  # noqa: PLC0415
+
+    with app.app_context():
+        row = db.query_one("SELECT id FROM admins WHERE username = ?", [username])
+        if row is None:
+            db.execute(
+                "INSERT INTO admins (username, password_hash, display_name, role, is_active) "
+                "VALUES (?, ?, ?, 'librarian', 1)",
+                [username, auth_passwords.hash_password(password), "冒烟测试馆员"],
+            )
+    client = Api(app.test_client())
+    payload = client.post("/api/auth/login", json={"username": username, "password": password}).get_json() or {}
+    client.csrf = payload.get("csrf_token")
+    return client
+
+
+def _b12_fake_restore_rejected(root: Path) -> bool:
+    """用一个假备份文件调恢复，期望在写目标库之前就被拒（``ValueError``）。"""
+    from library import backup as backup_module  # noqa: PLC0415
+
+    fake = Path(root) / "not-a-db.db"
+    fake.write_bytes(b"this is definitely not a sqlite database")
+    try:
+        backup_module.restore_backup(fake)
+    except ValueError:
+        return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _b12_restore_keeps_safety_copy(root: Path) -> bool:
+    """恢复时目标库已存在 → 必须先留一份 ``library-pre-restore-*.db``。
+
+    「恢复错了还能回头」全靠这份副本，属于运维安全的最后一道闸，必须钉死。
+    首次恢复（目标库不存在）按设计**不会**留副本，所以这里先造一个已存在的
+    目标库，再走一次完整的「备份文件 → 覆盖目标」：
+    目标已存在 + ``safety_copy`` 指向真实文件 = 通过。
+    """
+    from dataclasses import replace as _dc_replace  # noqa: PLC0415
+    from config import get_config, set_config  # noqa: PLC0415
+    from library import backup as backup_module  # noqa: PLC0415
+
+    backups = Path(root) / "backups"
+    sources = [p for p in sorted(backups.glob("library-*.db")) if p.is_file()]
+    if not sources:
+        return False
+
+    work = Path(root) / "safety"
+    work.mkdir(parents=True, exist_ok=True)
+    target = work / "s.db"
+    conn = sqlite3.connect(str(target))
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS books (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    saved = get_config()
+    try:
+        set_config(_dc_replace(saved, db_path=str(target), backup_dir=str(backups)))
+        result = backup_module.restore_backup(sources[0])
+    finally:
+        set_config(saved)
+
+    safety = Path(result.get("safety_copy") or "")
+    return safety.name.startswith("library-pre-restore-") and safety.is_file()
+
+
+@contextlib.contextmanager
+def b11_env(**values):
+    """临时设置环境变量并在退出时还原（配置解析用例专用）。
+
+    ``None`` 表示「临时删掉这个变量」，用来测「未设置时取默认值」。
+    """
+    saved = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def build_app(db_path: str):
@@ -541,6 +651,23 @@ def main() -> int:
     check("借书证号登录成功", r.status_code == 200, r.get_json())
     reader_csrf = r.get_json()["csrf_token"]
     check("读者登录返回本人信息", r.get_json()["member"]["card_no"] == "2026002", r.get_json())
+
+    # 新建读者的口令是「证号后 6 位」，可离线猜解 —— 必须先改掉才能用其他功能
+    check(
+        "新建读者带「首次登录须改密」标记",
+        r.get_json()["member"].get("must_change_password") is True,
+        r.get_json()["member"],
+    )
+    check("未改初始密码时借阅接口被拦 403", reader.get("/api/reader/loans").status_code == 403)
+    check(
+        "拦截返回明确错误码",
+        reader.get("/api/reader/loans").get_json()["error"]["code"] == "password_change_required",
+    )
+    check("未改密码时概览仍放行（页面要能加载出提示）", reader.get("/api/reader/me").status_code == 200)
+    check("未改密码时消息中心仍放行", reader.get("/api/reader/notifications").status_code == 200)
+    # 下面各节要验证正常的读者功能，先把这道闸门放过去；
+    # 闸门本身的完整覆盖（写操作被拦、改密后即解除）在 §32。
+    db.execute("UPDATE members SET must_change_password = 0 WHERE id = ?", [reader_id])
     check("读者登录不下发密码哈希", "password_hash" not in r.get_json()["member"], r.get_json()["member"])
 
     r = app.test_client().post("/api/reader/login", json={"account": "13800002222", "password": "026002"})
@@ -639,6 +766,12 @@ def main() -> int:
     check("管理员重置读者密码", r.status_code == 200 and r.get_json()["initial_password"] == "026002", r.get_json())
     check("重置后初始密码可登录", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "026002"}).status_code == 200)
     check("重置后旧密码失效", app.test_client().post("/api/reader/login", json={"account": "2026002", "password": "reader666"}).status_code == 401)
+
+    # 重置后的口令同样可猜解，所以「强制改密」必须重新武装
+    probe = app.test_client()
+    probe.post("/api/reader/login", json={"account": "2026002", "password": "026002"})
+    check("重置密码会重新要求改密", probe.get("/api/reader/loans").status_code == 403)
+    db.execute("UPDATE members SET must_change_password = 0 WHERE id = ?", [reader_id])
 
     reader_service.reader_throttle.reset()
     attacker = app.test_client()
@@ -990,6 +1123,8 @@ def main() -> int:
     r = sec_reader.post("/api/reader/login", json={"account": "8808002", "password": "808002"})
     check("安全段：读者乙登录", r.status_code == 200, r.get_json())
     sec_csrf = r.get_json()["csrf_token"]
+    # 本段验证登录标识唯一性，不是强制改密，先把闸门放过去
+    db.execute("UPDATE members SET must_change_password = 0 WHERE card_no IN ('8808001', '8808002', '8808003')")
     r = sec_reader.put("/api/reader/profile", json={"phone": "8808001"}, headers={"X-CSRF-Token": sec_csrf})
     check("读者自助改手机号撞他人证号被拒 409", r.status_code == 409, r.get_json())
     r = sec_reader.put("/api/reader/profile", json={"phone": "13100008001"}, headers={"X-CSRF-Token": sec_csrf})
@@ -1810,7 +1945,11 @@ def main() -> int:
             json={"card_no": card, "name": name, "member_type": "学生", "status": "active", "max_borrow": 50},
         )
         assert r.status_code in (200, 201), r.get_json()
-        return int(r.get_json()["id"])
+        member_id = int(r.get_json()["id"])
+        # 建号会带出「首次登录必须改密」，本节验证的是预约/缴费/挂失，先把闸门放过去
+        with res_app.app_context():
+            db.execute("UPDATE members SET must_change_password = 0 WHERE id = ?", [member_id])
+        return member_id
 
     def new_book(isbn: str, title: str, total: int = 1) -> int:
         r = radmin.post(
@@ -2033,7 +2172,16 @@ def main() -> int:
     left = radmin.get(f"/api/fines/member/{m_bing}").get_json()
     check("代收后该笔结清", all(i["loan_id"] != loan_admin["id"] for i in left["items"]), left.get("total_outstanding"))
 
-    waived = radmin.post("/api/fines/waive", json={"member_id": m_bing, "loan_id": loan_wv["id"]})
+    no_reason_waive = radmin.post("/api/fines/waive", json={"member_id": m_bing, "loan_id": loan_wv["id"]})
+    check(
+        "减免不写理由被 400 拒（减免是权力，必须留痕）",
+        no_reason_waive.status_code == 400 and no_reason_waive.get_json()["error"]["details"]["field"] == "note",
+        no_reason_waive.get_json(),
+    )
+    waived = radmin.post(
+        "/api/fines/waive",
+        json={"member_id": m_bing, "loan_id": loan_wv["id"], "note": "疫情闭馆期间免收"},
+    )
     check("馆员可减免滞纳金", waived.status_code == 200 and waived.get_json()["kind"] == "waiver", waived.get_json())
     left = radmin.get(f"/api/fines/member/{m_bing}").get_json()
     check("减免后该笔同样结清", all(i["loan_id"] != loan_wv["id"] for i in left["items"]), left.get("total_outstanding"))
@@ -2096,6 +2244,7 @@ def main() -> int:
     html_reader = (root_res / "templates" / "reader.html").read_text(encoding="utf-8")
     js_reader = (root_res / "static" / "js" / "reader.js").read_text(encoding="utf-8")
     css_reader = (root_res / "static" / "css" / "reader.css").read_text(encoding="utf-8")
+    css_admin = (root_res / "static" / "css" / "app.css").read_text(encoding="utf-8")
     check(
         "后台导航含「预约管理」入口且按权限隐藏",
         'data-view="reservations"' in html_admin and 'data-permission="loan:write" hidden' in html_admin,
@@ -2130,6 +2279,2190 @@ def main() -> int:
     check(
         "读者端预约支持取消、缴费支持一次结清",
         "data-cancel-res" in js_reader and 'all: true' in js_reader,
+    )
+
+    # ---- 31. 访客（未登录）能力：公告 / 办证预登记 / 借阅速查 / 馆藏分布 ----
+    # 同样用独立库：公告与办证申请都是"只增不减"的事实数据，混进主库会污染
+    # 前面各段的计数断言；独立库也让本段可以自由构造过期公告等时间场景。
+    print("\n=== 31. 访客（未登录）能力：公告、办证预登记、借阅速查与馆藏分布 ===")
+    vis_root = Path(tempfile.mkdtemp(prefix="visitor-smoke-"))
+    vis_app = build_app(str(vis_root / "visitor.db"))
+    vadmin = Api(vis_app.test_client())
+    vadmin.csrf = (
+        vadmin.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD}).get_json() or {}
+    ).get("csrf_token")
+    # 这两个限流器是模块级单例，跨用例共享计数；清零后本段才可重复运行
+    from library.applications import service as application_service  # noqa: PLC0415
+
+    application_service.submit_throttle.reset()
+    application_service.lookup_throttle.reset()
+
+    vadmin.post(
+        "/api/books",
+        json={
+            "isbn": "9787506365437", "title": "活着", "author": "余华", "publisher": "作家出版社",
+            "category": "文学", "publish_year": 2012, "location": "A区3排",
+            "total_copies": 2, "available_copies": 2, "description": "一个人一生的故事",
+        },
+    )
+    vadmin.post(
+        "/api/books",
+        json={
+            "isbn": "9787115428028", "title": "算法导论", "author": "Cormen", "publisher": "人民邮电",
+            "category": "计算机", "publish_year": 2013, "location": "B区1排",
+            "total_copies": 1, "available_copies": 1,
+        },
+    )
+    vadmin.post(
+        "/api/books",
+        json={"isbn": "9787020002207", "title": "未标架位", "category": "文学", "total_copies": 1},
+    )
+
+    # ---- 31.1 公告与开馆时间 ----
+    r = vadmin.post(
+        "/api/announcements",
+        json={
+            "title": "国庆开馆安排", "body": "10 月 1 日至 3 日闭馆", "kind": "notice",
+            "level": "important", "pinned": True, "status": "published",
+        },
+    )
+    check("馆员可新建公告（201）", r.status_code == 201, r.get_data(as_text=True))
+    notice = r.get_json()
+    check(
+        "公告带中文标签",
+        notice.get("level_label") == "重要" and notice.get("kind_label") == "公告",
+        notice,
+    )
+    check("无时间窗的公告长期有效", notice.get("window_label") == "长期有效" and notice["effective"] is True, notice)
+
+    r = vadmin.post(
+        "/api/announcements",
+        json={"title": "开馆时间", "body": "周一至周日 09:00-21:00", "kind": "hours", "status": "published"},
+    )
+    check("开馆时间用 kind=hours 承载（201）", r.status_code == 201, r.get_data(as_text=True))
+
+    draft = vadmin.post("/api/announcements", json={"title": "草稿公告", "kind": "notice", "status": "draft"}).get_json()
+    check("草稿公告可保存且不入门户", draft["status"] == "draft" and draft["effective"] is False, draft)
+
+    r = vadmin.post(
+        "/api/announcements",
+        json={"title": "已过期公告", "kind": "notice", "status": "published", "expire_at": "2020-01-01"},
+    )
+    expired = r.get_json()
+    check("过期公告被标记为不生效", r.status_code == 201 and expired["effective"] is False, expired)
+
+    r = vadmin.post("/api/announcements", json={"title": "未生效公告", "publish_at": "2099-01-01"})
+    check("生效时间在未来则不生效", r.status_code == 201 and r.get_json()["effective"] is False, r.get_json())
+
+    r = vadmin.post(
+        "/api/announcements", json={"title": "只给日期", "expire_at": "2099-06-30"}
+    ).get_json()
+    check(
+        "只填日期的失效时间顺延到当天 23:59:59（否则当天凌晨就失效）",
+        r["expire_at"] == "2099-06-30 23:59:59" and r["effective"] is True,
+        r.get("expire_at"),
+    )
+
+    check(
+        "失效早于生效被拒（400）",
+        vadmin.post("/api/announcements", json={"title": "时间倒挂", "publish_at": "2026-12-01", "expire_at": "2026-01-01"}).status_code == 400,
+    )
+    check("标题空白被拒（400）", vadmin.post("/api/announcements", json={"title": "   "}).status_code == 400)
+    check("非法类型被拒（400）", vadmin.post("/api/announcements", json={"title": "怪类型", "kind": "sos"}).status_code == 400)
+    check(
+        "时间格式非法被拒（400）",
+        vadmin.post("/api/announcements", json={"title": "怪时间", "publish_at": "2026/01/01"}).status_code == 400,
+    )
+
+    pub = vis_app.test_client().get("/api/public/overview").get_json()
+    titles = [a["title"] for a in pub["announcements"]]
+    check("门户只看到生效公告", "国庆开馆安排" in titles and "开馆时间" not in titles, titles)
+    check("草稿不进门户", "草稿公告" not in titles, titles)
+    check("过期公告不进门户", "已过期公告" not in titles, titles)
+    check("未生效公告不进门户", "未生效公告" not in titles, titles)
+    check("置顶公告排最前", bool(titles) and titles[0] == "国庆开馆安排", titles)
+    check("开馆时间单独返回（不混进公告栏）", (pub.get("hours") or {}).get("body") == "周一至周日 09:00-21:00", pub.get("hours"))
+
+    lst = vadmin.get("/api/announcements", query_string={"status": "draft"}).get_json()
+    check("后台按状态筛选草稿", lst["total"] == 1 and lst["items"][0]["title"] == "草稿公告", lst.get("total"))
+    kw = vadmin.get("/api/announcements", query_string={"keyword": "国庆"}).get_json()
+    check("后台按关键字筛选公告", kw["total"] == 1, kw.get("total"))
+    kind_hours = vadmin.get("/api/announcements", query_string={"kind": "hours"}).get_json()
+    check("后台按类型筛选开馆时间", kind_hours["total"] == 1, kind_hours.get("total"))
+    all_ann = vadmin.get("/api/announcements", query_string={"page_size": 100}).get_json()
+    check(
+        "后台列表带发布/草稿统计与类型选项",
+        all_ann["draft_total"] == 1 and all_ann["published_total"] >= 4 and len(all_ann["kinds"]) == 2,
+        (all_ann.get("draft_total"), all_ann.get("published_total")),
+    )
+
+    r = vadmin.put(f"/api/announcements/{draft['id']}", json={"title": "草稿公告（改）", "status": "draft"})
+    check("公告可编辑（PUT）", r.status_code == 200 and r.get_json()["title"] == "草稿公告（改）", r.get_data(as_text=True))
+    check("编辑不存在的公告 404", vadmin.put("/api/announcements/999999", json={"title": "无"}).status_code == 404)
+
+    r = vadmin.post(f"/api/announcements/{draft['id']}/status", json={"status": "published"})
+    check("草稿可一键发布", r.status_code == 200 and r.get_json()["status"] == "published", r.get_data(as_text=True))
+    check(
+        "非法状态被拒（400）",
+        vadmin.post(f"/api/announcements/{draft['id']}/status", json={"status": "nope"}).status_code == 400,
+    )
+    check("删除公告返回 200", vadmin.delete(f"/api/announcements/{draft['id']}").status_code == 200)
+    check("重复删除 404", vadmin.delete(f"/api/announcements/{draft['id']}").status_code == 404)
+    check(
+        "发布中的公告确认已从门户消失",
+        "草稿公告（改）" not in [a["title"] for a in vis_app.test_client().get("/api/public/overview").get_json()["announcements"]],
+    )
+
+    # ---- 31.2 馆藏分布导览 ----
+    vpub = vis_app.test_client()
+    locs = {x["location"]: x for x in vpub.get("/api/public/overview").get_json()["locations"]}
+    check("按位置聚合出 A区3排", "A区3排" in locs, list(locs))
+    check(
+        "位置聚合带种数 / 册数 / 可借册数 / 分类",
+        locs.get("A区3排", {}).get("titles") == 1
+        and locs["A区3排"]["copies"] == 2
+        and locs["A区3排"]["available_copies"] == 2
+        and locs["A区3排"]["categories"] == ["文学"],
+        locs.get("A区3排"),
+    )
+    check("未标架位的书单独归为一项并标记 pending", any(v["pending"] for v in locs.values()), locs)
+    names = vpub.get("/api/public/overview").get_json()["location_names"]
+    check("位置清单供检索下拉使用", "A区3排" in names and "B区1排" in names, names)
+
+    r = vpub.get("/api/public/search", query_string={"location": "B区1排"}).get_json()
+    check("按位置反查藏书", r["total"] == 1 and r["items"][0]["title"] == "算法导论", r.get("total"))
+    check("检索回带当前位置筛选项", r.get("location") == "B区1排", r.get("location"))
+    r = vpub.get("/api/public/search", query_string={"location": "__none__"}).get_json()
+    check("可单独筛出「未标架位」的书", r["total"] == 1 and r["items"][0]["title"] == "未标架位", r.get("total"))
+    r = vpub.get("/api/public/search", query_string={"location": "不存在的库位"}).get_json()
+    check("位置无命中返回空集而非报错", r["total"] == 0 and r["items"] == [], r.get("total"))
+
+    # ---- 31.3 在线办证预登记 ----
+    options = vpub.get("/api/public/overview").get_json()["application_options"]
+    check(
+        "门户可取到办证表单选项（前后端同源）",
+        options["member_types"] == ["VIP", "学生", "教师", "社会"] and "身份证" in options["id_types"],
+        options,
+    )
+
+    r = vpub.post(
+        "/api/public/member-applications",
+        json={
+            "name": "新读者", "phone": "13900001111", "email": "new@example.com",
+            "id_type": "身份证", "id_tail": "1234", "member_type": "社会", "note": "想借计算机类",
+        },
+    )
+    check("访客可提交办证申请（201）", r.status_code == 201, r.get_data(as_text=True))
+    app_code = (r.get_json() or {}).get("code", "")
+    check("申请编号形如 AC+日期-随机，并去掉易混字符", app_code.startswith("AC") and "-" in app_code, app_code)
+    check("申请初始状态为待审核", r.get_json().get("status") == "pending", r.get_json())
+
+    check(
+        "同一手机号重复提交被拒（409）",
+        vpub.post("/api/public/member-applications", json={"name": "重名", "phone": "13900001111"}).status_code == 409,
+    )
+    check("缺手机号被拒（400）", vpub.post("/api/public/member-applications", json={"name": "缺手机", "phone": ""}).status_code == 400)
+    check(
+        "手机号含非法字符被拒（400）",
+        vpub.post("/api/public/member-applications", json={"name": "手机怪", "phone": "abc-def"}).status_code == 400,
+    )
+    check(
+        "证件后 4 位含非法字符被拒（400）",
+        vpub.post("/api/public/member-applications", json={"name": "证件怪", "phone": "13900002222", "id_tail": "AB!1"}).status_code == 400,
+    )
+    check(
+        "非法读者类型被拒（400）",
+        vpub.post("/api/public/member-applications", json={"name": "类型怪", "phone": "13900002333", "member_type": "神仙"}).status_code == 400,
+    )
+    check(
+        "非法证件类型被拒（400）",
+        vpub.post("/api/public/member-applications", json={"name": "证件类型怪", "phone": "13900002444", "id_type": "手写"}).status_code == 400,
+    )
+
+    check(
+        "查询进度时手机号不符返回 404",
+        vpub.post("/api/public/member-applications/lookup", json={"code": app_code, "phone": "13999999999"}).status_code == 404,
+    )
+    r = vpub.post("/api/public/member-applications/lookup", json={"code": app_code, "phone": "13900001111"})
+    check("凭编号 + 手机号可查进度", r.status_code == 200 and r.get_json()["status"] == "pending", r.get_data(as_text=True))
+    check("待审核状态不暴露证号", "card_no" not in r.get_json(), r.get_json())
+    check("进度查询不回显手机号", "phone" not in r.get_json(), r.get_json())
+
+    vapps = vadmin.get("/api/applications", query_string={"status": "pending"}).get_json()
+    check("后台待审核列表可用", vapps["total"] == 1 and vapps["status_counts"]["pending"] == 1, vapps.get("total"))
+    check("后台列表手机号脱敏", vapps["items"][0]["phone_masked"] == "139****1111", vapps["items"][0].get("phone_masked"))
+    check("后台列表只显示证件后 4 位", vapps["items"][0]["id_tail_display"] == "****1234", vapps["items"][0].get("id_tail_display"))
+    check("后台列表带读者类型选项", vapps.get("member_types") == ["VIP", "学生", "教师", "社会"], vapps.get("member_types"))
+    app_id = vapps["items"][0]["id"]
+
+    r = vadmin.post(f"/api/applications/{app_id}/approve", json={"member_type": "社会"})
+    check("审核通过（200）", r.status_code == 200, r.get_data(as_text=True))
+    approved = r.get_json() or {}
+    card_no = approved.get("card_no", "")
+    check("自动生成 R 开头的 6 位证号", card_no.startswith("R") and len(card_no) == 6, card_no)
+    check("返回初始密码 = 证号后 6 位", approved.get("initial_password") == card_no[-6:], approved.get("initial_password"))
+    check("申请单回填证号", (approved.get("application") or {}).get("card_no") == card_no, approved.get("application"))
+    check("审核留痕审核人", bool((approved.get("application") or {}).get("reviewed_by")), approved.get("application"))
+    check("新读者档案为启用状态", (approved.get("member") or {}).get("status") == "active", approved.get("member"))
+
+    check(
+        "重复审核被拒（409）",
+        vadmin.post(f"/api/applications/{app_id}/approve", json={}).status_code == 409,
+    )
+    r = vpub.post("/api/public/member-applications/lookup", json={"code": app_code, "phone": "13900001111"})
+    check("通过后访客可查到证号", r.status_code == 200 and r.get_json().get("card_no") == card_no, r.get_json())
+    check(
+        "已办证手机号再申请被拒（409）",
+        vpub.post("/api/public/member-applications", json={"name": "又来了", "phone": "13900001111"}).status_code == 409,
+    )
+
+    vc_new = vis_app.test_client()
+    r = vc_new.post("/api/auth/login", json={"identifier": card_no, "password": approved.get("initial_password")})
+    check("新读者可用初始密码登录门户", r.status_code == 200 and r.get_json().get("role") == "reader", r.get_data(as_text=True))
+
+    # 驳回流程
+    r = vpub.post("/api/public/member-applications", json={"name": "被驳回", "phone": "13900003333"})
+    code2 = (r.get_json() or {}).get("code", "")
+    aid2 = vadmin.get("/api/applications", query_string={"status": "pending"}).get_json()["items"][0]["id"]
+    check("驳回必须填原因（400）", vadmin.post(f"/api/applications/{aid2}/reject", json={"reason": "  "}).status_code == 400)
+    r = vadmin.post(f"/api/applications/{aid2}/reject", json={"reason": "证件信息不完整"})
+    check("驳回成功并落状态", r.status_code == 200 and r.get_json()["status"] == "rejected", r.get_data(as_text=True))
+    r = vpub.post("/api/public/member-applications/lookup", json={"code": code2, "phone": "13900003333"})
+    check("驳回后访客能看到原因", r.get_json().get("reject_reason") == "证件信息不完整", r.get_json())
+    check(
+        "已驳回的申请不能再次审核（409）",
+        vadmin.post(f"/api/applications/{aid2}/approve", json={}).status_code == 409,
+    )
+
+    # 不填读者类型也必须能走完：默认取「社会」，否则建档案校验会把它挡下来
+    r = vpub.post("/api/public/member-applications", json={"name": "默认类型", "phone": "13900004444"})
+    check("不填读者类型也能提交", r.status_code == 201, r.get_data(as_text=True))
+    aid3 = vadmin.get("/api/applications", query_string={"keyword": "13900004444"}).get_json()["items"][0]["id"]
+    r = vadmin.post(f"/api/applications/{aid3}/approve", json={})
+    check(
+        "默认读者类型可审核通过（落「社会」）",
+        r.status_code == 200 and r.get_json()["member"]["member_type"] == "社会",
+        r.get_data(as_text=True),
+    )
+    check("申请列表可按手机号关键字过滤", vadmin.get("/api/applications", query_string={"keyword": "13900003333"}).get_json()["total"] == 1)
+
+    # ---- 31.4 免登录借阅速查 ----
+    q_member = vadmin.post(
+        "/api/members",
+        json={"card_no": "VS0001", "name": "速查读者", "member_type": "学生", "status": "active", "max_borrow": 5},
+    ).get_json()
+    qm_id = int(q_member["id"])
+    qb_id = vadmin.post(
+        "/api/books", json={"isbn": "9787121301234", "title": "速查用书", "category": "计算机", "total_copies": 1}
+    ).get_json()["id"]
+    check("前提：速查用书借出成功", vadmin.post("/api/loans/borrow", json={"book_id": qb_id, "member_id": qm_id}).status_code in (200, 201))
+
+    qc = vis_app.test_client()  # 全新会话：用来验证速查不会建立任何身份
+    check("速查缺账号被拒（400）", qc.post("/api/public/quick-check", json={"password": "x"}).status_code == 400)
+    check("速查缺密码被拒（400）", qc.post("/api/public/quick-check", json={"account": "VS0001"}).status_code == 400)
+    check("速查密码错误（401）", qc.post("/api/public/quick-check", json={"account": "VS0001", "password": "wrong-pass"}).status_code == 401)
+    check("速查账号不存在（401）", qc.post("/api/public/quick-check", json={"account": "查无此人", "password": "x"}).status_code == 401)
+
+    r = qc.post("/api/public/quick-check", json={"account": "VS0001", "password": "VS0001"})
+    check("速查成功（200）", r.status_code == 200, r.get_data(as_text=True))
+    q = r.get_json() or {}
+    qm = q.get("member") or {}
+    check("速查姓名脱敏", qm.get("name") == "速*读*者" or ("*" in str(qm.get("name")) and qm["name"].startswith("速")), qm)
+    check("速查证号脱敏为前 2 后 2", qm.get("card_no") == "VS***01", qm.get("card_no"))
+    check("速查不返回联系方式", "phone" not in qm and "email" not in qm, qm)
+    check(
+        "速查带汇总字段",
+        {"active_loans", "overdue_loans", "quota_left", "fine_outstanding", "reservation_ready"} <= set(q.get("summary") or {}),
+        q.get("summary"),
+    )
+    check("速查汇总反映真实在借", (q.get("summary") or {}).get("active_loans") == 1, q.get("summary"))
+    check("速查带最近应还时间", bool(q.get("next_due_at")), q.get("next_due_at"))
+    check("速查带回在借条目与状态标签", len(q.get("items") or []) == 1 and q["items"][0]["state_label"] == "在借", q.get("items"))
+    check("速查带查询时间戳", bool(q.get("checked_at")), q.get("checked_at"))
+    check("速查不建立会话（仍为未登录）", qc.get("/api/auth/me").status_code == 401)
+
+    # 共用登录限流桶：不能把免登录速查当成绕过登录锁定的爆破口
+    for _ in range(3):  # build_app 里 login_max_attempts=3
+        qc.post("/api/public/quick-check", json={"account": "VS0001", "password": "bad"})
+    r = qc.post("/api/public/quick-check", json={"account": "VS0001", "password": "VS0001"})
+    check(
+        "连续失败后速查被锁定（与登录共用计数，422）",
+        r.status_code == 422 and "失败次数过多" in r.get_json()["error"]["message"],
+        r.get_json(),
+    )
+    auth_service.login_throttle.reset()  # 清掉本段造出的锁定，避免影响后续
+
+    # ---- 31.5 权限边界 ----
+    check(
+        "建馆员账号成功",
+        vadmin.post(
+            "/api/accounts",
+            json={"username": "visclerk", "password": "visclerkpass", "role": "librarian", "display_name": "访客段馆员"},
+        ).status_code in (200, 201),
+    )
+    lc = Api(vis_app.test_client())
+    lc.csrf = (
+        lc.post("/api/auth/login", json={"username": "visclerk", "password": "visclerkpass"}).get_json() or {}
+    ).get("csrf_token")
+    check("馆员可发公告（announcement:write）", lc.post("/api/announcements", json={"title": "馆员发的公告", "kind": "notice"}).status_code == 201)
+    check("馆员可看待审办证申请（member:write）", lc.get("/api/applications").status_code == 200)
+    # 上面已提交 10 次（提交限流的阈值），先清零再走一次真实的发证写路径
+    application_service.submit_throttle.reset()
+    r = vis_app.test_client().post(
+        "/api/public/member-applications", json={"name": "馆员审核样本", "phone": "13900005555"}
+    )
+    check("前提：访客再提交一份申请", r.status_code == 201, r.get_data(as_text=True))
+    clerk_target = vadmin.get("/api/applications", query_string={"keyword": "13900005555"}).get_json()["items"][0]["id"]
+    r = lc.post(f"/api/applications/{clerk_target}/approve", json={})
+    check(
+        "馆员可审核发证（member:write 真正落到写路径）",
+        r.status_code == 200 and str(r.get_json().get("card_no", "")).startswith("R"),
+        r.get_data(as_text=True),
+    )
+    check("馆员无权管理后台账号（403）", lc.get("/api/accounts").status_code == 403)
+    check("馆员无权查看操作日志（403）", lc.get("/api/logs").status_code == 403)
+    check(
+        "馆员能力集含 announcement:write（前端据此显示入口）",
+        "announcement:write" in (lc.get("/api/auth/me").get_json() or {}).get("permissions", []),
+        lc.get("/api/auth/me").get_json(),
+    )
+
+    vanon = vis_app.test_client()
+    check("未登录读公告列表 401", vanon.get("/api/announcements").status_code == 401)
+    check("未登录读办证申请 401", vanon.get("/api/applications").status_code == 401)
+    check("未登录发公告 401", vanon.post("/api/announcements", json={"title": "偷偷发"}).status_code == 401)
+    check("未登录审核办证 401", vanon.post(f"/api/applications/{app_id}/approve", json={}).status_code == 401)
+
+    # ---- 31.6 前端资源契约 ----
+    html_portal = (root_res / "templates" / "public.html").read_text(encoding="utf-8")
+    js_portal = (root_res / "static" / "js" / "public.js").read_text(encoding="utf-8")
+    css_portal = (root_res / "static" / "css" / "public.css").read_text(encoding="utf-8")
+    check(
+        "门户含公告栏 / 馆藏分布 / 开馆时间三块的容器",
+        all(x in html_portal for x in ('id="noticeBoard"', 'id="noticeList"', 'id="locationBoard"', 'id="locationGrid"', 'id="aboutHours"')),
+    )
+    check(
+        "门户含在线办证与借阅速查两个入口与弹窗",
+        all(
+            x in html_portal
+            for x in ('id="applyCardBtn"', 'id="quickCheckBtn"', 'id="heroApplyBtn"', 'id="heroQuickBtn"', 'id="applyModal"', 'id="quickModal"')
+        ),
+    )
+    check(
+        "办证弹窗含提交 / 查进度两个页签与表单元素",
+        all(
+            x in html_portal
+            for x in ('data-pk-tab="form"', 'data-pk-tab="lookup"', 'id="applyForm"', 'id="lookupForm"', 'id="applyMemberType"', 'id="applyIdType"')
+        ),
+    )
+    check(
+        "门户 JS 调用免登录写入口并支持按位置筛选",
+        all(
+            x in js_portal
+            for x in ("/api/public/quick-check", "/api/public/member-applications", "filterByLocation", "clearLocationBtn")
+        ),
+    )
+    check(
+        "门户未加载后台样式表（新增样式必须自带）",
+        "public.css" in html_portal and "app.css" not in html_portal,
+    )
+    check(
+        "门户样式含公告 / 馆藏分布 / 弹窗三组新样式",
+        all(x in css_portal for x in (".notice-list", ".location-grid", ".pk-modal", ".pk-tab", ".pk-result")),
+    )
+    check(
+        "后台导航新增「办证审核」「公告管理」并按权限隐藏",
+        all(
+            x in html_admin
+            for x in ('data-view="applications"', 'data-permission="member:write"', 'data-view="announcements"', 'data-permission="announcement:write"')
+        ),
+    )
+    check(
+        "后台新增两个视图且结构完整",
+        all(
+            x in html_admin
+            for x in ('id="view-applications"', 'id="applicationTabs"', 'id="applicationTable"', 'id="view-announcements"', 'id="announcementTabs"', 'id="announcementTable"')
+        ),
+    )
+    check(
+        "后台 JS 接入公告与办证接口并支持审核/驳回/上下架",
+        all(
+            x in js_admin
+            for x in ("loadAnnouncements", "loadApplications", "doApproveApplication", "doRejectApplication", "doAnnouncementStatus", "/api/announcements", "/api/applications")
+        ),
+    )
+
+    # ==================================================================
+    # 32. 读者互动：强制改密闸门、通知中心、预约保留期与改约、书架、评价、
+    #     荐购登记、资料变更申请、电子借书证与 CSV 导出（第 10 批）
+    # ==================================================================
+    print("\n=== 32. 读者互动：闸门 / 通知 / 保留期 / 书架 / 评价 / 荐购 / 资料变更 ===")
+    eng_root = Path(tempfile.mkdtemp(prefix="engagement-smoke-"))
+    eng_app = build_app(str(eng_root / "eng.db"))
+    eadmin = Api(eng_app.test_client())
+    eadmin.csrf = (eadmin.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD}).get_json() or {}).get("csrf_token")
+
+    def e_member(card: str, name: str, mtype: str = "学生") -> int:
+        r = eadmin.post(
+            "/api/members",
+            json={"card_no": card, "name": name, "member_type": mtype, "status": "active", "max_borrow": 50},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def e_book(isbn: str, title: str, total: int = 2) -> int:
+        r = eadmin.post("/api/books", json={"isbn": isbn, "title": title, "category": "互动测试", "total_copies": total})
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def e_borrow(book_id: int, member_id: int):
+        return eadmin.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id})
+
+    def e_release_gate(member_id: int) -> None:
+        with eng_app.app_context():
+            db.execute("UPDATE members SET must_change_password = 0 WHERE id = ?", [member_id])
+
+    def e_reader(card: str, password: str = ""):
+        c = eng_app.test_client()
+        r = c.post("/api/reader/login", json={"account": card, "password": password or card})
+        assert r.status_code == 200, r.get_json()
+        return c, {"X-CSRF-Token": (r.get_json() or {}).get("csrf_token")}
+
+    m_pong = e_member("EN0001", "互动测试甲")
+    m_ping = e_member("EN0002", "互动测试乙", "教师")
+    b_review = e_book("9787020002207", "红楼梦（互动）")
+    b_fav = e_book("9787506365437", "活着（互动）")
+    b_hold = e_book("9787115428028", "算法导论（互动）", 1)
+    b_ready = e_book("9787108009821", "万历十五年（互动）", 1)
+
+    # ---- 32.1 强制改密闸门 ----
+    rpong, hpong = e_reader("EN0001")
+    check("闸门期间评价接口被拦", rpong.post("/api/reader/reviews", json={}, headers=hpong).status_code == 403)
+    check("闸门期间收藏接口被拦", rpong.post("/api/reader/favorites", json={}, headers=hpong).status_code == 403)
+    check("闸门期间荐购接口被拦", rpong.post("/api/reader/book-requests", json={}, headers=hpong).status_code == 403)
+    check("闸门期间资料变更接口被拦", rpong.post("/api/reader/profile-requests", json={}, headers=hpong).status_code == 403)
+    check("闸门期间改约接口被拦", rpong.post("/api/reader/reservations/1/rebook", json={}, headers=hpong).status_code == 403)
+    bad = rpong.post("/api/reader/password", json={"old_password": "错密码", "new_password": "newpass123"}, headers=hpong)
+    check("闸门改密填错旧密码被拒并指明字段", bad.status_code == 400 and bad.get_json()["error"]["details"]["field"] == "old_password", bad.get_json())
+    same = rpong.post("/api/reader/password", json={"old_password": "EN0001", "new_password": "EN0001"}, headers=hpong)
+    check("闸门改密新旧相同被拒", same.status_code == 400 and same.get_json()["error"]["details"]["field"] == "new_password", same.get_json())
+    okpwd = rpong.post("/api/reader/password", json={"old_password": "EN0001", "new_password": "newpass123"}, headers=hpong)
+    check("闸门改密成功", okpwd.status_code == 200, okpwd.get_json())
+    with eng_app.app_context():
+        flag = db.query_one("SELECT must_change_password FROM members WHERE id = ?", [m_pong])
+    check("改密后解除「首次登录须改密」标记", flag and not int(flag["must_change_password"]), flag)
+    check("改密后原会话被强制退出", rpong.get("/api/reader/me").status_code == 401)
+    relogin = eng_app.test_client().post("/api/reader/login", json={"account": "EN0001", "password": "newpass123"})
+    check("改密后可用新口令登录", relogin.status_code == 200, relogin.get_json())
+    check("改密后标记不再出现", relogin.get_json()["member"]["must_change_password"] is False, relogin.get_json()["member"])
+
+    # ---- 32.2 借阅与预约底座 ----
+    e_release_gate(m_ping)
+    loan_rev = e_borrow(b_review, m_pong)
+    eadmin.post(f"/api/loans/{loan_rev.get_json()['id']}/return")
+    loan_fav = e_borrow(b_fav, m_pong)
+    eadmin.post(f"/api/loans/{loan_fav.get_json()['id']}/return")
+    e_borrow(b_hold, m_ping)  # 占满唯一复本 → 甲可预约
+    e_borrow(b_ready, m_ping)  # 同上
+    rpong, hpong = e_reader("EN0001", "newpass123")
+    rping, hping = e_reader("EN0002")
+
+    res_wait = rpong.post("/api/reader/reservations", json={"book_id": b_hold}, headers=hpong)
+    check("预约已借完的图书成功", res_wait.status_code in (200, 201), res_wait.get_json())
+    res_ready = rpong.post("/api/reader/reservations", json={"book_id": b_ready}, headers=hpong)
+    check("第二条预约进入排队", res_ready.status_code in (200, 201), res_ready.get_json())
+    ready_id = int(res_ready.get_json()["id"])
+    marked = eadmin.post(f"/api/reservations/{ready_id}/ready")
+    check("馆员通知到书", marked.status_code == 200 and marked.get_json()["status"] == "ready", marked.get_json())
+    decorated = marked.get_json()
+    check(
+        "已到书预约带取书保留期倒计时",
+        decorated.get("expires_at") and decorated.get("hold_left_days") is not None and "剩" in (decorated.get("hold_label") or ""),
+        decorated,
+    )
+    check("保留期来自配置（3 天）", int(decorated.get("hold_days") or 0) == 3, decorated.get("hold_days"))
+
+    # ---- 32.3 我的书架（收藏） ----
+    fav = rpong.post("/api/reader/favorites", json={"book_id": b_fav, "note": "寒假读完"}, headers=hpong)
+    check("收藏图书成功", fav.status_code == 201 and fav.get_json()["note"] == "寒假读完", fav.get_json())
+    check("收藏条目带馆藏状态", fav.get_json().get("state_label", "").startswith("可借"), fav.get_json())
+    check("收藏条目不外泄 member_id", "member_id" not in fav.get_json(), list(fav.get_json().keys()))
+    dup = rpong.post("/api/reader/favorites", json={"book_id": b_fav}, headers=hpong)
+    check("重复收藏被 409 拦下", dup.status_code == 409, dup.get_json())
+    # 回归：备注修改与移除都要走 get_favorite()，而它此前漏 SELECT member_id 导致 500
+    upd = rpong.put(f"/api/reader/favorites/{fav.get_json()['id']}", json={"note": "改成下学期读"}, headers=hpong)
+    check("修改收藏备注成功（回归：member_id 缺列曾致 500）", upd.status_code == 200 and upd.get_json()["note"] == "改成下学期读", upd.get_json())
+    listed = rpong.get("/api/reader/favorites", query_string={"keyword": "活着"})
+    check("书架支持关键词检索", listed.status_code == 200 and listed.get_json()["total"] == 1, listed.get_json())
+    # 他人书架条目按「不存在」处理，不区分 404 语义
+    foreign = rpong.put("/api/reader/favorites/999999", json={"note": "x"}, headers=hpong)
+    check("修改他人/不存在的收藏返回 404", foreign.status_code == 404, foreign.status_code)
+
+    # ---- 32.4 评价 ----
+    denied = rpong.post("/api/reader/reviews", json={"book_id": b_hold, "rating": 5}, headers=hpong)
+    check("没借过的书不能评价", denied.status_code == 422 and "才能评价" in denied.get_json()["error"]["message"], denied.get_json())
+    rev = rpong.post("/api/reader/reviews", json={"book_id": b_review, "rating": 4, "content": "常读常新"}, headers=hpong)
+    check("借过并归还的书可评价", rev.status_code in (200, 201) and rev.get_json()["review"]["rating"] == 4, rev.get_json())
+    again = rpong.post("/api/reader/reviews", json={"book_id": b_review, "rating": 5, "content": "再读一遍"}, headers=hpong)
+    check("同一本书再次评价为覆盖", again.status_code == 200 and again.get_json()["created"] is False and again.get_json()["review"]["rating"] == 5, again.get_json())
+    check("评价覆盖后评分聚合取最新值", again.get_json()["summary"]["avg"] == 5.0, again.get_json()["summary"])
+    pend = rpong.get("/api/reader/reviews/pending")
+    check("待评价清单来自已归还借阅", pend.status_code == 200 and any(i["book_id"] == b_fav for i in pend.get_json()["items"]), pend.get_json())
+    check("已评价的书不再出现在待评价里", all(i["book_id"] != b_review for i in pend.get_json()["items"]), pend.get_json())
+
+    rping, hping = e_reader("EN0002")
+    loan_p = e_borrow(b_review, m_ping)
+    eadmin.post(f"/api/loans/{loan_p.get_json()['id']}/return")
+    rping.post("/api/reader/reviews", json={"book_id": b_review, "rating": 3, "content": "一般"}, headers=hping)
+    mylist = rpong.get("/api/reader/reviews", query_string={"page": 1, "page_size": 10})
+    check("我的评价只含本人记录", mylist.status_code == 200 and all(i["member_card"] == "EN0001" for i in mylist.get_json()["items"]), mylist.get_json())
+    pub = eng_app.test_client().get(f"/api/public/books/{b_review}/reviews")
+    displays = [i["member_display"] for i in pub.get_json()["items"]]
+    check(
+        "门户评价列表只露姓氏（完整姓名不出现在响应里）",
+        pub.status_code == 200 and len(displays) == 2 and all("*" in d and len(d) >= 2 for d in displays),
+        displays,
+    )
+    check("门户评价响应不含读者证号", "member_card" not in pub.get_data(as_text=True), None)
+    check("门户评价聚合条数正确", pub.get_json()["summary"]["total"] == 2, pub.get_json()["summary"])
+
+    # ---- 32.5 荐购登记 ----
+    req = rpong.post(
+        "/api/reader/book-requests",
+        json={"title": "置身事内", "author": "兰小欢", "isbn": "9787208171789", "reason": "课程参考"},
+        headers=hpong,
+    )
+    check("荐购登记成功", req.status_code == 201 and req.get_json()["status_label"] == "待处理", req.get_json())
+    noreply = eadmin.post(f"/api/engagement/book-requests/{req.get_json()['id']}/review", json={"status": "rejected"})
+    check("未采纳必须填写答复", noreply.status_code == 400 and noreply.get_json()["error"]["details"]["field"] == "reply", noreply.get_json())
+    rejected = eadmin.post(f"/api/engagement/book-requests/{req.get_json()['id']}/review", json={"status": "rejected", "reply": "已有馆藏副本"})
+    check("驳回后状态流转并记录答复", rejected.status_code == 200 and rejected.get_json()["status"] == "rejected", rejected.get_json())
+    myreqs = rpong.get("/api/reader/book-requests", query_string={"page": 1})
+    check("读者能看到处理结论与答复", myreqs.get_json()["items"][0]["reply"] == "已有馆藏副本", myreqs.get_json()["items"])
+
+    # ---- 32.6 资料变更申请 ----
+    pr = rpong.post("/api/reader/profile-requests", json={"field": "name", "new_value": "互动测试甲乙", "reason": "改名"}, headers=hpong)
+    check("提交姓名变更申请", pr.status_code == 201 and pr.get_json()["status_label"] == "待审核", pr.get_json())
+    prdup = rpong.post("/api/reader/profile-requests", json={"field": "name", "new_value": "另一个名字"}, headers=hpong)
+    check("同字段重复申请被 409 拦下", prdup.status_code == 409, prdup.get_json())
+    prsame = rpong.post("/api/reader/profile-requests", json={"field": "member_type", "new_value": "学生"}, headers=hpong)
+    check("新值与当前值相同被拒", prsame.status_code == 400 and prsame.get_json()["error"]["details"]["field"] == "new_value", prsame.get_json())
+    badfield = rpong.post("/api/reader/profile-requests", json={"field": "phone", "new_value": "13800000000"}, headers=hpong)
+    check("手机号不允许走审批（应自助修改）", badfield.status_code == 400, badfield.get_json())
+    check("回归：资料变更返回 status_label（此前缺失导致前端标签为空）", bool(pr.get_json().get("status_label")), pr.get_json())
+    no_reason = eadmin.post(f"/api/engagement/profile-requests/{pr.get_json()['id']}/review", json={"approve": False})
+    check("驳回资料变更必须说明原因", no_reason.status_code == 400 and no_reason.get_json()["error"]["details"]["field"] == "reply", no_reason.get_json())
+    approved = eadmin.post(f"/api/engagement/profile-requests/{pr.get_json()['id']}/review", json={"approve": True, "reply": "已核对"})
+    check("通过后状态流转", approved.status_code == 200 and approved.get_json()["status"] == "approved", approved.get_json())
+    mem_after = eadmin.get(f"/api/members/{m_pong}").get_json()
+    check("通过后读者资料已回写", mem_after["name"] == "互动测试甲乙", mem_after)
+    # 回归：收藏的 PUT/DELETE 与资料变更列表都在同一条仓储 SELECT 上
+    fav_del = rpong.delete(f"/api/reader/favorites/{fav.get_json()['id']}", headers=hpong)
+    check("移除收藏成功（回归：member_id 缺列曾致 500）", fav_del.status_code == 200, fav_del.get_json())
+
+    # ---- 32.7 站内通知中心 ----
+    notif = rpong.get("/api/reader/notifications", query_string={"kind": "all", "page": 1})
+    check("通知中心可访问且先做惰性扫描", notif.status_code == 200 and "unread" in notif.get_json(), notif.status_code)
+    kinds = {i["kind"] for i in notif.get_json()["items"]}
+    check("审核结果会写入读者通知", "profile" in kinds and "book_request" in kinds, kinds)
+    check("预约到书会写入读者通知", "reservation_ready" in kinds, kinds)
+    unread_before = int(notif.get_json()["unread"])
+    first_unread = next(i for i in notif.get_json()["items"] if not i["read"])
+    mark = rpong.post(f"/api/reader/notifications/{first_unread['id']}/read", headers=hpong)
+    check("单条标记已读后未读数递减", mark.status_code == 200 and mark.get_json()["unread"] == unread_before - 1, mark.get_json())
+    foreign_notif = rpong.post("/api/reader/notifications/999999/read", headers=hpong)
+    check("标记他人/不存在通知返回 404", foreign_notif.status_code == 404, foreign_notif.status_code)
+    readall = rpong.post("/api/reader/notifications/read-all", headers=hpong)
+    check("全部标记已读后未读清零", readall.status_code == 200 and readall.get_json()["unread"] == 0, readall.get_json())
+    sent = eadmin.post(f"/api/members/{m_pong}/notify", json={"title": "请尽快归还", "body": "《算法导论》已逾期", "link_view": "loans"})
+    check("馆员可向读者发站内通知", sent.status_code == 201 and sent.get_json()["kind"] == "system", sent.get_json())
+    badlink = eadmin.post(f"/api/members/{m_pong}/notify", json={"title": "x", "link_view": "http://evil.example"})
+    check("通知跳转目标必须是白名单视图", badlink.status_code == 400 and badlink.get_json()["error"]["details"]["field"] == "link_view", badlink.get_json())
+    me_after = rpong.get("/api/reader/me").get_json()
+    check("概览返回未读数与保留期配置", "notifications" in me_after and me_after["rules"].get("reservation_hold_days") == 3, me_after.get("rules"))
+    check("概览不下发密码哈希", "password_hash" not in me_after["member"], list(me_after["member"].keys()))
+
+    # ---- 32.8 预约改约 ----
+    b_swap = e_book("9787532733143", "枪炮病菌与钢铁（互动）", 1)
+    loan_s = e_borrow(b_swap, m_ping)  # 占满唯一复本，甲才能改约到它
+    rebook_same = rpong.post(f"/api/reader/reservations/{ready_id}/rebook", json={"book_id": b_ready}, headers=hpong)
+    check("改约到同一本书被拒", rebook_same.status_code == 409, rebook_same.get_json())
+    rebook = rpong.post(f"/api/reader/reservations/{ready_id}/rebook", json={"book_id": b_swap}, headers=hpong)
+    check(
+        "改约成功并返回新预约（关旧单 + 开新单同事务）",
+        rebook.status_code == 200 and rebook.get_json()["closed_id"] == ready_id and rebook.get_json()["reservation"]["book_id"] == b_swap,
+        rebook.get_json(),
+    )
+    with eng_app.app_context():
+        old_status = db.query_one("SELECT status FROM reservations WHERE id = ?", [ready_id])
+    check("原预约被关闭而不是删除", old_status and old_status["status"] == "cancelled", old_status)
+    foreign_res = rping.post(f"/api/reader/reservations/{rebook.get_json()['reservation']['id']}/rebook", json={"book_id": b_hold}, headers=hping)
+    check("不能改约他人的预约", foreign_res.status_code in (403, 404, 409), foreign_res.status_code)
+
+    # ---- 32.9 前端资源契约（读者门户 + 后台互动视图） ----
+    check(
+        "读者页含改密遮罩 / 铃铛 / 消息中心 / 书架 / 评价 / 荐购 / 资料变更 / 借书证",
+        all(
+            x in html_reader
+            for x in ('id="pwGate"', 'id="bellBtn"', 'id="notifyList"', 'id="shelfGrid"', 'id="reviewableList"', 'id="bookRequestForm"', 'id="profileRequestForm"', 'id="eCard"')
+        ),
+    )
+    check(
+        "读者页引入自实现的条码与二维码脚本",
+        '/static/js/barcode.js' in html_reader and '/static/js/qrcode.js' in html_reader,
+    )
+    check(
+        "读者 JS 接入全部新接口",
+        all(
+            x in js_reader
+            for x in (
+                "/api/reader/notifications",
+                "/api/reader/favorites",
+                "/api/reader/reviews",
+                "/api/reader/book-requests",
+                "/api/reader/profile-requests",
+                "/rebook",
+                "downloadCsv",
+                "QRCode",
+                "Barcode",
+            )
+        ),
+    )
+    check("读者样式含遮罩 / 铃铛 / 书架 / 弹窗 / 借书证", all(x in css_reader for x in (".pw-gate", ".bell-badge", ".shelf-card", ".dlg-mask", ".e-card", ".hold-note")))
+    check(
+        "后台新增「读者互动」入口与视图结构",
+        all(
+            x in html_admin
+            for x in ('data-view="engagement"', 'id="view-engagement"', 'id="engagementKindTabs"', 'id="engagementStatusTabs"', 'id="engagementTable"', 'id="engagementPending"')
+        ),
+    )
+    check(
+        "后台 JS 接入互动审核与读者发通知",
+        all(x in js_admin for x in ("loadEngagement", "setReviewStatus", "reviewBookRequest", "reviewProfileRequest", "openMemberNotify", "/api/engagement/")),
+    )
+    check(
+        "二维码脚本自检可用（无第三方依赖）",
+        "selfTest" in (root_res / "static" / "js" / "qrcode.js").read_text(encoding="utf-8")
+        and "QRCode" in (root_res / "static" / "js" / "qrcode.js").read_text(encoding="utf-8"),
+    )
+
+    # ==================================================================
+    # 33. 流通馆员规模化作业（第 11 批）
+    #     批量导入（模板 / 预览 / 逐行报错 / 唯一冲突 / 逐行独立事务）
+    #     批量催还（计数与幂等）、六个视图 CSV 导出契约
+    #     赔偿处理（登记 / 重复 409 / 结案联动库存与罚金 / 注销）
+    #     盘点（开单快照 / 实盘 / 差异 / 调账校验 / 关闭冻结）
+    #     采编验收（ISBN 去重加册与新建）、打印排版、读者附件上传、定时释放
+    # ==================================================================
+    print("\n=== 33. 流通馆员规模化作业：导入 / 催还 / 赔偿 / 盘点 / 采编 / 附件 / 打印 ===")
+    import config as b11_config  # noqa: PLC0415 - 仅本段使用
+
+    with b11_env(
+        LIBRARY_SWEEP_INTERVAL_SECONDS="900",
+        LIBRARY_UPLOAD_DIR=str(Path(tempfile.gettempdir()) / "b11-uploads"),
+        LIBRARY_UPLOAD_MAX_MB="8",
+    ):
+        b11_loaded = b11_config.load_config()
+    check(
+        "新增三项配置可从环境变量读取",
+        b11_loaded.sweep_interval_seconds == 900
+        and b11_loaded.upload_max_mb == 8
+        and b11_loaded.upload_dir.endswith("b11-uploads"),
+        (b11_loaded.sweep_interval_seconds, b11_loaded.upload_max_mb, b11_loaded.upload_dir),
+    )
+    with b11_env(LIBRARY_SWEEP_INTERVAL_SECONDS="0"):
+        check(
+            "扫描间隔 0 表示退回纯惰性模式",
+            b11_config.load_config().sweep_interval_seconds == 0,
+        )
+    with b11_env(LIBRARY_SWEEP_INTERVAL_SECONDS="100000"):
+        check("扫描间隔超上限被拒绝启动", config_rejected(b11_config))
+
+    b11_root = Path(tempfile.mkdtemp(prefix="batch11-smoke-"))
+    b11_cfg = Config(
+        db_path=str(b11_root / "b11.db"),
+        host="127.0.0.1",
+        port=8000,
+        debug=False,
+        loan_days=30,
+        max_renew=2,
+        fine_per_day=0.5,
+        default_max_borrow=50,
+        log_level="WARNING",
+        secret_key="test-secret-b11",
+        library_name="测试图书馆",
+        admin_user=ADMIN_USER,
+        admin_password=ADMIN_PWD,
+        login_max_attempts=3,
+        login_lock_minutes=5,
+        cookie_secure=False,
+        # 上传目录随临时库走，避免污染工作区；1MB 上限让「超限」用例不必造大文件
+        upload_dir=str(b11_root / "uploads"),
+        upload_max_mb=1,
+    )
+    b11_app = create_app(b11_cfg)
+    b11 = Api(b11_app.test_client())
+    b11.csrf = (
+        b11.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD}).get_json() or {}
+    ).get("csrf_token")
+
+    with b11_app.app_context():
+        b11_tables = {
+            row["name"] for row in db.query_all("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    b11_new_tables = {"compensations", "stocktaking_batches", "stocktaking_items", "acquisitions", "member_files"}
+    check("新增五张表（赔偿 / 盘点单 / 盘点明细 / 采编 / 附件）", b11_new_tables <= b11_tables, sorted(b11_new_tables - b11_tables))
+
+    def b11_member(card, name, mtype="学生"):
+        r = b11.post(
+            "/api/members",
+            json={"card_no": card, "name": name, "member_type": mtype, "status": "active", "max_borrow": 50},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def b11_book(isbn, title, total=1, location=""):
+        r = b11.post(
+            "/api/books",
+            json={"isbn": isbn, "title": title, "category": "第11批", "total_copies": total, "location": location},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def b11_borrow(book_id, member_id):
+        r = b11.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id})
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def b11_backdate(loan_id, days=10):
+        """把某笔借阅的应还日期回填到 N 天前（造逾期，不动借出时间）。"""
+        with b11_app.app_context():
+            db.execute(
+                "UPDATE loans SET due_at = datetime('now', 'localtime', ?) WHERE id = ?",
+                [f"-{int(days)} days", int(loan_id)],
+            )
+
+    def b11_total(book_id):
+        return int(b11.get(f"/api/books/{book_id}").get_json()["total_copies"])
+
+    def b11_available(book_id):
+        return int(b11.get(f"/api/books/{book_id}").get_json()["available_copies"])
+
+    def b11_members_total():
+        return int(b11.get("/api/members").get_json()["total"])
+
+    def b11_books_total():
+        return int(b11.get("/api/books").get_json()["total"])
+
+    # ---- 33.1 批量导入：模板 ----
+    tpl_books = b11.get("/api/import/books/template")
+    body_books = tpl_books.get_data()
+    check(
+        "图书导入模板可下载且是带 BOM 的 CSV",
+        tpl_books.status_code == 200
+        and body_books.startswith("\ufeff".encode("utf-8"))
+        and "text/csv" in tpl_books.headers.get("Content-Type", ""),
+        tpl_books.headers.get("Content-Type"),
+    )
+    check(
+        "图书模板表头与解析器一致（服务端生成，不会各说各话）",
+        all(x in body_books.decode("utf-8-sig") for x in ("书名", "ISBN", "总册数", "馆藏位置", "馆藏条码")),
+        body_books.decode("utf-8-sig")[:60],
+    )
+    tpl_members = b11.get("/api/import/members/template")
+    check(
+        "读者导入模板含必需列与示例行",
+        tpl_members.status_code == 200
+        and tpl_members.get_data().decode("utf-8-sig").startswith("姓名,读者证号")
+        and "示例：张三" in tpl_members.get_data().decode("utf-8-sig"),
+    )
+
+    # ---- 33.2 批量导入：解析与逐行报错 ----
+    empty = b11.post("/api/import/books", json={"csv": "   ", "dry_run": True})
+    check(
+        "空内容导入被 400 拦下",
+        empty.status_code == 400 and empty.get_json()["error"]["details"]["field"] == "csv",
+        empty.get_json(),
+    )
+    missing_col = b11.post("/api/import/books", json={"csv": "书名,作者\n测试,某人\n", "dry_run": True})
+    check(
+        "缺少必需列（ISBN）时明确点名缺哪一列",
+        missing_col.status_code == 400
+        and "isbn" in missing_col.get_json()["error"]["message"].lower()
+        and missing_col.get_json()["error"]["details"]["columns"] == ["isbn"],
+        missing_col.get_json(),
+    )
+
+    books_before = b11_books_total()
+    csv_preview = (
+        "书名,ISBN,作者,总册数,馆藏位置\n"
+        "导入测试一,9787000000001,甲,2,A区-9排\n"
+        "导入测试坏行,123,乙,1,A区-9排\n"
+        "导入测试重复,9787000000001,丙,1,A区-9排\n"
+    )
+    preview = b11.post("/api/import/books", json={"csv": csv_preview, "dry_run": True})
+    prev_json = preview.get_json()
+    check(
+        "预览返回逐行结果与总计",
+        preview.status_code == 200
+        and prev_json["total"] == 3
+        and prev_json["created"] == 0
+        and [r["status"] for r in prev_json["rows"]] == ["ok", "failed", "failed"],
+        prev_json,
+    )
+    check(
+        "预览逐行标出行号与原因（ISBN 位数不合法）",
+        prev_json["rows"][1]["line"] == 3 and "10 位或 13 位" in prev_json["rows"][1]["message"],
+        prev_json["rows"][1],
+    )
+    check(
+        "文件内重复被单独点出（不与「库里已有」混淆）",
+        "文件内重复" in prev_json["rows"][2]["message"],
+        prev_json["rows"][2],
+    )
+    check("预览不写库", b11_books_total() == books_before, b11_books_total())
+
+    # ---- 33.3 批量导入：正式写入与逐行独立 ----
+    real = b11.post("/api/import/books", json={"csv": csv_preview})
+    real_json = real.get_json()
+    check(
+        "正式导入落库：成功 1 行、失败 2 行",
+        real.status_code == 200 and real_json["created"] == 1 and real_json["failed"] == 2 and real_json["ok"] is False,
+        real_json,
+    )
+    check("导入后馆藏总数 +1", b11_books_total() == books_before + 1, b11_books_total())
+    dup_db = b11.post(
+        "/api/import/books",
+        json={"csv": "书名,ISBN\n另起书名,9787000000001\n", "dry_run": False},
+    )
+    check(
+        "与库中已有 ISBN 冲突时报「已存在」（不是 500）",
+        dup_db.status_code == 200
+        and dup_db.get_json()["failed"] == 1
+        and "已存在" in dup_db.get_json()["rows"][0]["message"],
+        dup_db.get_json(),
+    )
+    check("冲突行不落库（总数不变）", b11_books_total() == books_before + 1, b11_books_total())
+
+    members_before = b11_members_total()
+    csv_members = (
+        "姓名,读者证号,读者类型,手机号\n"
+        "导入读者甲,I0001,学生,13900000001\n"
+        "导入读者乙,I0001,教师,13900000002\n"
+        "导入读者丙,I0003,学生,13900000001\n"
+    )
+    mem_prev = b11.post("/api/import/members", json={"csv": csv_members, "dry_run": True}).get_json()
+    check(
+        "读者导入预览：证号重复与手机号重复分别拦截",
+        mem_prev["total"] == 3
+        and mem_prev["failed"] == 2
+        and "读者证号" in mem_prev["rows"][1]["message"]
+        and "手机号" in mem_prev["rows"][2]["message"],
+        mem_prev["rows"],
+    )
+    mem_real = b11.post("/api/import/members", json={"csv": csv_members}).get_json()
+    check(
+        "读者导入正式执行：1 行成功 2 行失败（单行失败不拖垮整批）",
+        mem_real["created"] == 1 and mem_real["failed"] == 2,
+        mem_real,
+    )
+    check("读者总数 +1", b11_members_total() == members_before + 1, b11_members_total())
+
+    # ---- 33.4 批量催还 ----
+    m_ov1 = b11_member("B11B001", "催还测试甲")
+    m_ov2 = b11_member("B11B002", "催还测试乙")
+    b_ov1 = b11_book("9787000000011", "催还测试书一", 1)
+    b_ov2 = b11_book("9787000000012", "催还测试书二", 1)
+    b_ok = b11_book("9787000000013", "催还测试书三", 1)
+    b_done = b11_book("9787000000014", "催还测试书四", 1)
+    loan_ov1 = b11_borrow(b_ov1, m_ov1)
+    loan_ov2 = b11_borrow(b_ov2, m_ov2)
+    loan_ok = b11_borrow(b_ok, m_ov1)
+    loan_done = b11_borrow(b_done, m_ov2)
+    b11.post(f"/api/loans/{loan_done}/return")
+    b11_backdate(loan_ov1, 12)
+    b11_backdate(loan_ov2, 7)
+    b11_backdate(loan_done, 20)  # 已归还，不算「待催」
+    overdue_total = int(b11.get("/api/loans", query_string={"status": "overdue", "page_size": 100}).get_json()["total"])
+    check("逾期口径：只有未归还且过应还日的计入", overdue_total == 2, overdue_total)
+
+    first_notify = b11.post("/api/loans/notify-overdue", json={})
+    notify_json = first_notify.get_json()
+    check(
+        "批量催还按当前逾期清单发送",
+        first_notify.status_code == 200 and notify_json["sent"] == overdue_total and notify_json["members"] == 2,
+        notify_json,
+    )
+    again_notify = b11.post("/api/loans/notify-overdue", json={}).get_json()
+    check(
+        "重复催还幂等（同一借阅同一应还日不刷屏）",
+        again_notify["sent"] == 0 and again_notify["skipped"] == overdue_total,
+        again_notify,
+    )
+    done_notify = b11.post("/api/loans/notify-overdue", json={"ids": [loan_done]})
+    check(
+        "对已归还借阅催还被 422 拒",
+        done_notify.status_code == 422 and "已归还" in done_notify.get_json()["error"]["message"],
+        done_notify.get_json(),
+    )
+    fresh_notify = b11.post("/api/loans/notify-overdue", json={"ids": [loan_ok]})
+    check(
+        "对未逾期借阅催还被 422 拒",
+        fresh_notify.status_code == 422 and "尚未逾期" in fresh_notify.get_json()["error"]["message"],
+        fresh_notify.get_json(),
+    )
+    with b11_app.app_context():
+        notif_rows = db.query_all(
+            "SELECT COUNT(*) AS n FROM notifications WHERE kind = 'overdue' AND ref_type = 'loan'"
+        )
+    check("催还通知落库条数与发送数一致", int(notif_rows[0]["n"]) == overdue_total, notif_rows)
+
+    # ---- 33.5 赔偿处理 ----
+    m_cp = b11_member("B11C001", "赔偿测试甲")
+    b_lost = b11_book("9787000000021", "赔偿测试书（丢失）", 3)
+    b_dmg = b11_book("9787000000022", "赔偿测试书（损毁）", 2)
+    loan_lost = b11_borrow(b_lost, m_cp)
+    loan_dmg = b11_borrow(b_dmg, m_cp)
+    # 先借完再回填逾期：读者一旦有逾期未还，后续借书会被业务规则拦下
+    loan_ret = b11_borrow(b11_book("9787000000023", "赔偿测试书（已还）", 1), m_cp)
+    b11.post(f"/api/loans/{loan_ret}/return")
+    b11_backdate(loan_lost, 10)
+    b11_backdate(loan_dmg, 4)
+
+    bad_amount = b11.post("/api/compensations", json={"loan_id": loan_lost, "kind": "lost", "amount": 0})
+    check(
+        "赔偿金额为 0 被 400 拒并指明字段",
+        bad_amount.status_code == 400 and bad_amount.get_json()["error"]["details"]["field"] == "amount",
+        bad_amount.get_json(),
+    )
+    bad_kind = b11.post("/api/compensations", json={"loan_id": loan_lost, "kind": "eaten", "amount": 10})
+    check("赔偿类型非法被 400 拒", bad_kind.status_code == 400, bad_kind.get_json())
+
+    reg_lost = b11.post(
+        "/api/compensations",
+        json={"loan_id": loan_lost, "kind": "lost", "amount": 59.8, "note": "读者确认遗失"},
+    )
+    comp_lost = reg_lost.get_json()
+    check(
+        "登记丢书赔偿成功并带书名与读者（列表可直接展示）",
+        reg_lost.status_code == 201
+        and comp_lost["status"] == "pending"
+        and comp_lost["amount"] == 59.8
+        and "赔偿测试书（丢失）" in comp_lost["book_title"],
+        comp_lost,
+    )
+    dup_reg = b11.post("/api/compensations", json={"loan_id": loan_lost, "kind": "lost", "amount": 20})
+    check("同一借阅重复登记赔付被 409 拦下", dup_reg.status_code == 409, dup_reg.get_json())
+
+    ret_lost = b11.post("/api/compensations", json={"loan_id": loan_ret, "kind": "lost", "amount": 30})
+    check(
+        "已归还的借阅不能按「丢失」登记（提示改选损毁）",
+        ret_lost.status_code == 422 and "图书损毁" in ret_lost.get_json()["error"]["message"],
+        ret_lost.get_json(),
+    )
+
+    reg_dmg = b11.post("/api/compensations", json={"loan_id": loan_dmg, "kind": "damaged", "amount": 18.0})
+    comp_dmg = reg_dmg.get_json()
+    check("损毁赔偿在借状态下可登记", reg_dmg.status_code == 201 and comp_dmg["kind_label"] == "图书损毁", comp_dmg)
+
+    listed = b11.get("/api/compensations").get_json()
+    check(
+        "赔偿列表按状态可控且带汇总",
+        listed["total"] == 2
+        and listed["summaries"]["pending_amount"] == 77.8
+        and set(listed["kind_labels"]) == {"lost", "damaged"},
+        listed["summaries"],
+    )
+    over_paid = b11.post(f"/api/compensations/{comp_lost['id']}/settle", json={"paid_amount": 100})
+    check(
+        "实收超过应赔被 422 拒",
+        over_paid.status_code == 422 and "不能超过" in over_paid.get_json()["error"]["message"],
+        over_paid.get_json(),
+    )
+
+    outstanding = b11.get(f"/api/fines/member/{m_cp}").get_json()["items"]
+    owed_lost = next((i["outstanding"] for i in outstanding if i["loan_id"] == loan_lost), 0.0)
+    check("逾期未还借阅确实产生待缴滞纳金（供赔偿联动减免）", owed_lost > 0, outstanding)
+
+    total_before = b11_total(b_lost)
+    avail_before = b11_available(b_lost)
+    settle_lost = b11.post(
+        f"/api/compensations/{comp_lost['id']}/settle",
+        json={"note": "全额赔付", "close_loan": True, "waive_fine": True},
+    )
+    settle_json = settle_lost.get_json()
+    check(
+        "按丢失结案：借阅置为已归还、赔偿单结案",
+        settle_lost.status_code == 200 and settle_json["status"] == "settled" and settle_json["closed_loan"] is True,
+        settle_json,
+    )
+    check(
+        "按丢失结案：总册数 -1 且可借数不变（书不在架，不能回补库存）",
+        b11_total(b_lost) == total_before - 1 and b11_available(b_lost) == avail_before,
+        (b11_total(b_lost), b11_available(b_lost), total_before, avail_before),
+    )
+    check(
+        "结案时同步减免该笔逾期滞纳金（金额与应缴一致）",
+        abs(float(settle_json["waived_fine"]) - float(owed_lost)) < 0.005,
+        (settle_json["waived_fine"], owed_lost),
+    )
+    after_waive = b11.get(f"/api/fines/member/{m_cp}").get_json()["items"]
+    check("减免后该笔不再出现在待缴清单", all(i["loan_id"] != loan_lost for i in after_waive), after_waive)
+
+    re_settle = b11.post(f"/api/compensations/{comp_lost['id']}/settle", json={})
+    check("已结案的赔偿单不能重复结案（409）", re_settle.status_code == 409, re_settle.get_json())
+    re_cancel = b11.post(f"/api/compensations/{comp_lost['id']}/cancel", json={})
+    check("已结案的赔偿单不能注销（409）", re_cancel.status_code == 409, re_cancel.get_json())
+    cancel_dmg = b11.post(f"/api/compensations/{comp_dmg['id']}/cancel", json={"note": "读者已修复赔书"})
+    check(
+        "待结案赔偿单可注销",
+        cancel_dmg.status_code == 200 and cancel_dmg.get_json()["status"] == "cancelled",
+        cancel_dmg.get_json(),
+    )
+    missing_cp = b11.get("/api/compensations/999999")
+    check("不存在的赔偿单返回 404", missing_cp.status_code == 404, missing_cp.status_code)
+
+    # ---- 33.6 盘点：开单快照 → 实盘 → 差异 → 关闭 → 调账 ----
+    b_st1 = b11_book("9787000000031", "盘点书一", 3, location="P区-1排")
+    b_st2 = b11_book("9787000000032", "盘点书二", 2, location="P区-1排")
+    b_st3 = b11_book("9787000000033", "盘点书三", 1, location="P区-2排")
+
+    empty_scope = b11.post("/api/stocktaking", json={"location": "不存在的馆位"})
+    check(
+        "空范围开单被 422 拒",
+        empty_scope.status_code == 422 and "没有可盘点" in empty_scope.get_json()["error"]["message"],
+        empty_scope.get_json(),
+    )
+    batch = b11.post("/api/stocktaking", json={"location": "P区-1排", "note": "季度盘点"}).get_json()
+    check(
+        "按馆位开单：单号规范、明细为开单时的快照",
+        batch["code"].startswith("PD") and batch["item_count"] == 2 and batch["status"] == "open" and len(batch["items"]) == 2,
+        batch,
+    )
+    check(
+        "明细带书名与应盘册数（快照值）",
+        sum(i["expected_copies"] for i in batch["items"]) == 5 and all(i["state"] == "pending" for i in batch["items"]),
+        batch["items"],
+    )
+    batch2 = b11.post("/api/stocktaking", json={"location": "P区-1排"})
+    check(
+        "同一馆位不允许同时开两张盘点单（409）",
+        batch2.status_code == 409 and batch2.get_json()["error"]["details"]["field"] == "location",
+        batch2.get_json(),
+    )
+    other_batch = b11.post("/api/stocktaking", json={"location": "P区-2排"}).get_json()
+    apply_open = b11.post(f"/api/stocktaking/{other_batch['id']}/apply", json={})
+    check(
+        "未关闭就调账被 422 拒（先确认差异、再改账）",
+        apply_open.status_code == 422 and "先关闭" in apply_open.get_json()["error"]["message"],
+        apply_open.get_json(),
+    )
+
+    item_a = next(i for i in batch["items"] if i["book_id"] == b_st1)
+    item_b = next(i for i in batch["items"] if i["book_id"] == b_st2)
+    set_a = b11.put(f"/api/stocktaking/{batch['id']}/items/{item_a['id']}", json={"counted_copies": 2})
+    set_json = set_a.get_json()
+    check(
+        "录入实盘数后差异即时算出并刷新进度",
+        set_a.status_code == 200
+        and set_json["counted_count"] == 1
+        and set_json["progress"] == 50.0
+        and next(i for i in set_json["items"] if i["id"] == item_a["id"])["state_label"] == "盘亏 1",
+        set_json,
+    )
+    b11.put(f"/api/stocktaking/{batch['id']}/items/{item_b['id']}", json={"counted_copies": 3})
+    batch_detail = b11.get(f"/api/stocktaking/{batch['id']}").get_json()
+    check(
+        "汇总卡正确区分账实一致 / 盘盈 / 盘亏",
+        batch_detail["summary"]["up"] == 1 and batch_detail["summary"]["down"] == 1 and batch_detail["summary"]["diff_total"] == 0,
+        batch_detail["summary"],
+    )
+    filtered = b11.get(f"/api/stocktaking/{batch['id']}", query_string={"state": "up"}).get_json()
+    check("可按差异类型筛选明细", len(filtered["items"]) == 1 and filtered["items"][0]["book_id"] == b_st2, filtered["items"])
+    bad_count = b11.put(f"/api/stocktaking/{batch['id']}/items/{item_a['id']}", json={"counted_copies": -1})
+    check(
+        "实盘册数负数被 400 拒",
+        bad_count.status_code == 400 and bad_count.get_json()["error"]["details"]["field"] == "counted_copies",
+        bad_count.get_json(),
+    )
+    cleared = b11.put(f"/api/stocktaking/{batch['id']}/items/{item_a['id']}", json={"counted_copies": ""})
+    check("留空表示撤销该项盘点", cleared.get_json()["summary"]["pending"] == 1, cleared.get_json()["summary"])
+    b11.put(f"/api/stocktaking/{batch['id']}/items/{item_a['id']}", json={"counted_copies": 2})
+
+    closed = b11.post(f"/api/stocktaking/{batch['id']}/close", json={})
+    check("关闭盘点单冻结明细", closed.status_code == 200 and closed.get_json()["status"] == "closed", closed.get_json())
+    frozen = b11.put(f"/api/stocktaking/{batch['id']}/items/{item_a['id']}", json={"counted_copies": 5})
+    check("关闭后不能再录实盘数（409）", frozen.status_code == 409, frozen.get_json())
+    del_closed = b11.delete(f"/api/stocktaking/{batch['id']}")
+    check("已关闭的盘点单不可删除（留作盘点记录）", del_closed.status_code == 409, del_closed.get_json())
+
+    applied = b11.post(f"/api/stocktaking/{batch['id']}/apply", json={})
+    applied_json = applied.get_json()
+    check(
+        "按差异调账：两处差异都写回库存",
+        applied.status_code == 200 and applied_json["applied"] == 2,
+        applied_json,
+    )
+    check(
+        "调账后总册数等于实盘数",
+        b11_total(b_st1) == 2 and b11_total(b_st2) == 3,
+        (b11_total(b_st1), b11_total(b_st2)),
+    )
+    again_apply = b11.post(f"/api/stocktaking/{batch['id']}/apply", json={}).get_json()
+    check(
+        "重复调账结果幂等（快照差异不变，写回的仍是同一组数值）",
+        again_apply["applied"] == 2 and b11_total(b_st1) == 2 and b11_total(b_st2) == 3,
+        again_apply,
+    )
+
+    # 调账不得把总册数压到低于在借册数，且校验必须先于任何写入
+    m_st = b11_member("B11D001", "盘点测试甲")
+    m_st2 = b11_member("B11D002", "盘点测试乙")
+    b_st4 = b11_book("9787000000034", "盘点书四", 3, location="P区-3排")
+    b_st5 = b11_book("9787000000035", "盘点书五", 2, location="P区-3排")
+    b11_borrow(b_st4, m_st)
+    b11_borrow(b_st4, m_st2)
+    batch3 = b11.post("/api/stocktaking", json={"location": "P区-3排"}).get_json()
+    i4 = next(i for i in batch3["items"] if i["book_id"] == b_st4)
+    i5 = next(i for i in batch3["items"] if i["book_id"] == b_st5)
+    b11.put(f"/api/stocktaking/{batch3['id']}/items/{i4['id']}", json={"counted_copies": 1})
+    b11.put(f"/api/stocktaking/{batch3['id']}/items/{i5['id']}", json={"counted_copies": 4})
+    b11.post(f"/api/stocktaking/{batch3['id']}/close", json={})
+    conflict_apply = b11.post(f"/api/stocktaking/{batch3['id']}/apply", json={})
+    check(
+        "实盘数低于在借册数时调账被 422 拒",
+        conflict_apply.status_code == 422 and "在借" in conflict_apply.get_json()["error"]["message"],
+        conflict_apply.get_json(),
+    )
+    check(
+        "校验先于写入：合法项也不会被半截调账（书五仍为 2 册）",
+        b11_total(b_st4) == 3 and b11_total(b_st5) == 2,
+        (b11_total(b_st4), b11_total(b_st5)),
+    )
+    reopened = b11.post(f"/api/stocktaking/{batch3['id']}/reopen", json={})
+    check("已关闭的盘点单可重新打开补盘", reopened.status_code == 200 and reopened.get_json()["status"] == "open")
+    del_open = b11.delete(f"/api/stocktaking/{batch3['id']}")
+    check("进行中的盘点单可以删除", del_open.status_code == 200, del_open.get_json())
+    b11.delete(f"/api/stocktaking/{other_batch['id']}")
+
+    # ---- 33.7 采编验收 ----
+    books_before_acq = b11_books_total()
+    acq = b11.post(
+        "/api/acquisitions",
+        json={
+            "title": "采编测试新书",
+            "isbn": "9787000000041",
+            "author": "采编者",
+            "publisher": "测试社",
+            "copies": 2,
+            "unit_price": 39.9,
+            "location": "C区-1排",
+            "supplier": "某书商",
+        },
+    ).get_json()
+    check(
+        "登记到货单不直接进馆藏（status=pending，金额=册数×单价）",
+        acq["status"] == "pending" and acq["amount"] == 79.8 and b11_books_total() == books_before_acq,
+        acq,
+    )
+    check("到货单能识别馆里还没有同 ISBN 的书", acq["existing_book_id"] is None, acq)
+    accepted = b11.post(f"/api/acquisitions/{acq['id']}/accept", json={})
+    acc_json = accepted.get_json()
+    check(
+        "验收新 ISBN：自动建档并分配馆藏条码",
+        accepted.status_code == 200 and acc_json["mode"] == "created" and acc_json["book_id"],
+        acc_json,
+    )
+    check("建档后馆藏总数 +1，册数等于到货册数", b11_books_total() == books_before_acq + 1 and b11_total(acc_json["book_id"]) == 2)
+    barcode = b11.get(f"/api/books/{acc_json['book_id']}").get_json()["barcode"]
+    check("自动分配的条码非空", bool(barcode), barcode)
+    re_accept = b11.post(f"/api/acquisitions/{acq['id']}/accept", json={})
+    check("已验收的单不能重复验收（409）", re_accept.status_code == 409, re_accept.get_json())
+    del_accepted = b11.delete(f"/api/acquisitions/{acq['id']}")
+    check("已验收的到货单不可删除（留作采购记录）", del_accepted.status_code == 409, del_accepted.get_json())
+
+    acq2 = b11.post(
+        "/api/acquisitions",
+        json={"title": "采编测试新书（补订）", "isbn": "9787000000041", "copies": 3, "unit_price": 39.9},
+    ).get_json()
+    check(
+        "同 ISBN 再次到货时提示将「加册」而不是新建",
+        acq2["existing_book_id"] == acc_json["book_id"],
+        acq2,
+    )
+    total_before_acq2 = b11_total(acc_json["book_id"])
+    accepted2 = b11.post(f"/api/acquisitions/{acq2['id']}/accept", json={}).get_json()
+    check(
+        "同 ISBN 验收走加册分支（不新增书目）",
+        accepted2["mode"] == "add_copies" and b11_books_total() == books_before_acq + 1,
+        accepted2,
+    )
+    check(
+        "加册后总册数与可借数同步 +3",
+        b11_total(acc_json["book_id"]) == total_before_acq2 + 3,
+        b11_total(acc_json["book_id"]),
+    )
+
+    acq_no_isbn = b11.post("/api/acquisitions", json={"title": "无书号的到货", "copies": 1}).get_json()
+    no_isbn = b11.post(f"/api/acquisitions/{acq_no_isbn['id']}/accept", json={})
+    check(
+        "没有 ISBN 又无同书可加册时验收被 422 拒（不静默丢数据）",
+        no_isbn.status_code == 422 and "ISBN" in no_isbn.get_json()["error"]["message"],
+        no_isbn.get_json(),
+    )
+    no_reason = b11.post(f"/api/acquisitions/{acq_no_isbn['id']}/reject", json={})
+    check(
+        "驳回必须写原因（400 且指明字段）",
+        no_reason.status_code == 400 and no_reason.get_json()["error"]["details"]["field"] == "reason",
+        no_reason.get_json(),
+    )
+    rejected = b11.post(f"/api/acquisitions/{acq_no_isbn['id']}/reject", json={"reason": "到货与订单不符"})
+    check("驳回后状态流转", rejected.status_code == 200 and rejected.get_json()["status"] == "rejected", rejected.get_json())
+    acq_list = b11.get("/api/acquisitions").get_json()
+    check(
+        "到货单列表带状态汇总",
+        acq_list["summaries"]["pending"] == 0
+        and acq_list["summaries"]["accepted_copies"] == 5
+        and set(acq_list["status_labels"]) == {"pending", "accepted", "rejected"},
+        acq_list["summaries"],
+    )
+
+    # ---- 33.8 读者附件 ----
+    PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64 + b"IEND\xaeB`\x82"
+    PDF_BYTES = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n" + b"\x00" * 32
+    m_file = b11_member("B11E001", "附件测试甲")
+    up = b11.post(
+        "/api/member-files",
+        data={"member_id": str(m_file), "kind": "photo", "label": "证件照", "file": (io.BytesIO(PNG_BYTES), "photo.png")},
+        content_type="multipart/form-data",
+    )
+    up_json = up.get_json()
+    check(
+        "上传读者照片成功并可直接内联展示（url + is_image）",
+        up.status_code == 201 and up_json["is_image"] is True and up_json["url"].startswith("/api/member-files/"),
+        up_json,
+    )
+    check(
+        "磁盘存储名由服务端随机生成、不含路径分隔符",
+        "/" not in up_json["stored_name"] and "\\" not in up_json["stored_name"] and up_json["stored_name"].endswith(".png"),
+        up_json["stored_name"],
+    )
+    with b11_app.app_context():
+        from library.memberfiles import service as memberfile_service  # noqa: PLC0415
+
+        stored_path = memberfile_service.path_of(up_json)
+    check(
+        "落盘位置在「上传根目录/读者 ID」下（路径穿越无效）",
+        stored_path.exists() and stored_path.parent.name == str(m_file),
+        str(stored_path),
+    )
+
+    wrong_ext = b11.post(
+        "/api/member-files",
+        data={"member_id": str(m_file), "kind": "photo", "file": (io.BytesIO(PNG_BYTES), "evil.txt")},
+        content_type="multipart/form-data",
+    )
+    check(
+        "扩展名白名单拦截（.txt 被 400 拒）",
+        wrong_ext.status_code == 400 and wrong_ext.get_json()["error"]["details"]["field"] == "file",
+        wrong_ext.get_json(),
+    )
+    spoofed = b11.post(
+        "/api/member-files",
+        data={"member_id": str(m_file), "kind": "photo", "file": (io.BytesIO(PDF_BYTES), "fake.png")},
+        content_type="multipart/form-data",
+    )
+    check(
+        "魔数校验拦截「改扩展名伪装」（PNG 名 + PDF 内容被 400 拒）",
+        spoofed.status_code == 400 and "实际内容" in spoofed.get_json()["error"]["message"],
+        spoofed.get_json(),
+    )
+    too_big = b11.post(
+        "/api/member-files",
+        data={
+            "member_id": str(m_file),
+            "kind": "photo",
+            "file": (io.BytesIO(PNG_BYTES + b"\x00" * (1024 * 1024 + 16)), "big.png"),
+        },
+        content_type="multipart/form-data",
+    )
+    check(
+        "超过大小上限被 400 拒",
+        too_big.status_code == 400 and "上限" in too_big.get_json()["error"]["message"],
+        too_big.get_json(),
+    )
+    bad_kind = b11.post(
+        "/api/member-files",
+        data={"member_id": str(m_file), "kind": "video", "file": (io.BytesIO(PNG_BYTES), "a.png")},
+        content_type="multipart/form-data",
+    )
+    check("附件类型非法被 400 拒", bad_kind.status_code == 400, bad_kind.get_json())
+
+    pdf_up = b11.post(
+        "/api/member-files",
+        data={"member_id": str(m_file), "kind": "id_card", "file": (io.BytesIO(PDF_BYTES), "id.pdf")},
+        content_type="multipart/form-data",
+    ).get_json()
+    files_list = b11.get("/api/member-files", query_string={"member_id": m_file}).get_json()
+    check(
+        "附件列表按类型分组（照片 / 证件）并带上限提示",
+        len(files_list["photos"]) == 1
+        and len(files_list["id_cards"]) == 1
+        and files_list["photos"][0]["kind_label"] == "读者照片"
+        and files_list["id_cards"][0]["kind_label"] == "证件影像"
+        and files_list["max_size_mb"] == 1,
+        files_list,
+    )
+    check("PDF 附件标记为非图片（前端走占位图标）", pdf_up["is_image"] is False and pdf_up["size_label"].endswith("B"))
+
+    anonymous = b11_app.test_client().get(f"/api/member-files/{up_json['id']}")
+    check("未登录不能下载读者附件（401，无公开直链）", anonymous.status_code == 401, anonymous.status_code)
+    got = b11.get(f"/api/member-files/{up_json['id']}")
+    check(
+        "登录后可下载附件且禁止任何中间层缓存",
+        got.status_code == 200
+        and got.headers.get("Content-Type", "").startswith("image/png")
+        and "no-store" in got.headers.get("Cache-Control", ""),
+        (got.headers.get("Content-Type"), got.headers.get("Cache-Control")),
+    )
+    check("下载内容与上传字节一致", got.get_data() == PNG_BYTES, len(got.get_data()))
+    # Windows 上未关闭的响应会一直占着文件句柄，导致后续 unlink 报 WinError 32
+    got.close()
+    deleted = b11.delete(f"/api/member-files/{up_json['id']}")
+    check("删除附件返回被删记录", deleted.status_code == 200 and deleted.get_json()["kind"] == "photo", deleted.get_json())
+    check("删除后磁盘文件同步清理", not stored_path.exists(), str(stored_path))
+    after_del = b11.get("/api/member-files", query_string={"member_id": m_file}).get_json()
+    check("删除后列表不再包含该附件", len(after_del["photos"]) == 0, after_del)
+    missing_file = b11.get("/api/member-files/999999")
+    check("不存在的附件返回 404", missing_file.status_code == 404, missing_file.status_code)
+
+    # ---- 33.9 定时释放与通知全量扫描 ----
+    from library import scheduler  # noqa: PLC0415
+
+    b_hold = b11_book("9787000000051", "定时释放测试书", 1)
+    m_hold = b11_member("B11F001", "定时测试甲")
+    b11_borrow(b_hold, m_hold)  # 占满唯一复本
+    m_wait = b11_member("B11F002", "定时测试乙")
+    book_hold_id = b_hold
+    # 新建读者的初始口令 = 证号后 6 位
+    m_wait_pwd = "B11F002"[-6:]
+    # 预约读者要走读者端写接口，先解除「首次登录须改密」闸门
+    with b11_app.app_context():
+        for mid in (m_hold, m_wait):
+            db.execute("UPDATE members SET must_change_password = 0 WHERE id = ?", [mid])
+    reader_client = b11_app.test_client()
+    login = reader_client.post("/api/reader/login", json={"account": "B11F002", "password": m_wait_pwd})
+    check("新建读者可用默认初始口令登录读者端", login.status_code == 200, login.get_json())
+    rcsrf = (login.get_json() or {}).get("csrf_token")
+    booked = reader_client.post(
+        "/api/reader/reservations", json={"book_id": book_hold_id}, headers={"X-CSRF-Token": rcsrf}
+    )
+    check("预约已借完的图书成功", booked.status_code in (200, 201), booked.get_json())
+    ready = b11.post(f"/api/reservations/{booked.get_json()['id']}/ready")
+    check("馆员标记到书", ready.status_code == 200 and ready.get_json()["status"] == "ready", ready.get_json())
+    with b11_app.app_context():
+        db.execute(
+            "UPDATE reservations SET ready_at = datetime('now', 'localtime', '-10 days') WHERE id = ?",
+            [int(booked.get_json()["id"])],
+        )
+        db.execute(
+            "UPDATE loans SET due_at = datetime('now', 'localtime', '-2 days') WHERE book_id = ? AND returned_at IS NULL",
+            [book_hold_id],
+        )
+    sweep = with_ctx(b11_app, scheduler.run_once)
+    check(
+        "定时扫描返回预约释放 / 通知 / 邮件出站计数",
+        isinstance(sweep, dict)
+        and set(sweep) == {"expired_reservations", "members", "due_soon", "overdue", "mail"},
+        sweep,
+    )
+    check("超期未取的「已到书」预约被自动释放", sweep["expired_reservations"] >= 1, sweep)
+    check("全量扫描覆盖有在借记录的读者", sweep["members"] >= 2 and sweep["overdue"] >= 1, sweep)
+    with b11_app.app_context():
+        res_row = db.query_one("SELECT status FROM reservations WHERE id = ?", [int(booked.get_json()["id"])])
+    check("预约状态落为 expired", res_row and res_row["status"] == "expired", res_row)
+    check("重复扫描不重复释放（幂等）", with_ctx(b11_app, scheduler.run_once)["expired_reservations"] == 0)
+    check("默认不启动后台线程（测试与嵌入式用法零副作用）", scheduler.is_running() is False)
+    started = scheduler.start(b11_app, interval=3600)
+    check("显式调用可启动后台线程", started is True and scheduler.is_running() is True)
+    check("重复启动被忽略", scheduler.start(b11_app, interval=3600) is False)
+    scheduler.stop()
+    check("停止后线程退出", scheduler.is_running() is False)
+    check("间隔为 0 时不启动线程", scheduler.start(b11_app, interval=0) is False)
+
+    # ---- 33.10 打印排版与前端契约 ----
+    check(
+        "后台含打印层与两张打印入口（催还单 / 借书凭证）",
+        all(x in html_admin for x in ('id="printLayer"', 'id="loanPrintOverdue"', 'id="loanNotifyOverdue"')),
+    )
+    check(
+        "后台 JS 实现催还单、借书凭证与批量催还",
+        all(x in js_admin for x in ("printOverdueSlips", "printLoanReceipt", "notifyOverdue")),
+    )
+    check(
+        "打印样式覆盖凭证 / 催还单 / 书标三类版式",
+        all(x in css_admin for x in (".print-sheet", ".ps-sign", ".print-label", ".print-layer")),
+    )
+    check(
+        "催还单按条码标签同样的「块级平铺」写法（flex 会让 page-break 失效）",
+        "display: inline-block" in css_admin and "@media print" in css_admin,
+    )
+    check(
+        "后台新增五个入口与视图骨架",
+        all(
+            x in html_admin
+            for x in (
+                'data-view="fines"',
+                'data-view="compensations"',
+                'data-view="stocktaking"',
+                'data-view="acquisitions"',
+                'data-view="imports"',
+                'id="view-fines"',
+                'id="view-compensations"',
+                'id="view-stocktaking"',
+                'id="view-acquisitions"',
+                'id="view-imports"',
+            )
+        ),
+    )
+    check(
+        "后台 JS 接入五组新视图与批量导入",
+        all(
+            x in js_admin
+            for x in (
+                "loadFines",
+                "loadCompensations",
+                "loadStocktaking",
+                "loadAcquisitions",
+                "loadImportsView",
+                "runImport",
+                "/api/compensations",
+                "/api/stocktaking",
+                "/api/acquisitions",
+                "/api/import/",
+            )
+        ),
+    )
+    check(
+        "罚金减免走二次确认（金额 + 理由摆在一起再确认）",
+        "confirmFineWaiver" in js_admin and ".confirm-block" in css_admin and ".confirm-amount" in css_admin,
+    )
+    check(
+        "六个视图补齐 CSV 导出按钮与导出函数",
+        all(
+            x in html_admin
+            for x in (
+                'id="fineExport"',
+                'id="compensationExport"',
+                'id="acquisitionExport"',
+                'id="reservationExport"',
+                'id="logExport"',
+                'id="announcementExport"',
+                'id="applicationExport"',
+                'id="engagementExport"',
+            )
+        )
+        and all(
+            x in js_admin
+            for x in (
+                "exportFines",
+                "exportCompensations",
+                "exportAcquisitions",
+                "exportReservations",
+                "exportLogs",
+                "exportAnnouncements",
+                "exportApplications",
+                "exportEngagementRows",
+            )
+        ),
+    )
+    check(
+        "导入结果面板支持逐行标红与失败行样式",
+        all(x in html_admin for x in ('id="importPaste"', 'id="importPreview"', 'id="importRun"', 'id="importResultTable"'))
+        and all(x in css_admin for x in (".import-panel", ".row-bad", ".import-tip")),
+    )
+    check(
+        "读者附件弹窗与列表样式齐备",
+        "openMemberFilesDialog" in js_admin
+        and all(x in css_admin for x in (".file-list", ".file-item", ".fi-thumb", ".fi-actions")),
+    )
+    # ==================== 第 12 批：跨身份系统级缺口 ====================
+    import base64 as b12_b64  # noqa: PLC0415
+    import io as b12_io  # noqa: PLC0415
+    import zipfile as b12_zip  # noqa: PLC0415
+
+    from library import backup as b12_backup  # noqa: PLC0415
+    from library import scheduler as b12_scheduler  # noqa: PLC0415
+    from library.auth import permissions as b12_perm  # noqa: PLC0415
+    from library.importer import xlsx as b12_xlsx  # noqa: PLC0415
+    from config import get_config as b12_get_config, set_config as b12_set_config  # noqa: PLC0415
+    from app import build_parser as b12_build_parser  # noqa: PLC0415
+
+    print("\n=== 34. 系统级补全：读能力 / 备份恢复 / 调度留痕 / 邮件出站 / 审批流 / xlsx ===")
+
+    # ---- 34.1 读能力矩阵（声明了就必须生效） ----
+    check(
+        "管理员拥有全部能力（含新增的四项读能力与审批权）",
+        set(b12_perm.capabilities_for("admin")) == set(b12_perm.ALL_CAPABILITIES)
+        and len(b12_perm.ALL_CAPABILITIES) == 12,
+        sorted(b12_perm.ALL_CAPABILITIES),
+    )
+    check(
+        "馆员具备读写业务能力，但不含审批 / 账号 / 日志",
+        set(b12_perm.capabilities_for("librarian"))
+        == {
+            "book:read",
+            "book:write",
+            "member:read",
+            "member:write",
+            "loan:read",
+            "loan:write",
+            "announcement:read",
+            "announcement:write",
+            "dashboard:read",
+        },
+        sorted(b12_perm.capabilities_for("librarian")),
+    )
+    check("未知角色得到空能力集（失败即拒绝）", b12_perm.capabilities_for("auditor") == frozenset())
+
+    b12_root = Path(tempfile.mkdtemp(prefix="batch12-smoke-"))
+    b12_cfg = Config(
+        db_path=str(b12_root / "b12.db"),
+        host="127.0.0.1",
+        port=8000,
+        debug=False,
+        loan_days=30,
+        max_renew=2,
+        fine_per_day=0.5,
+        default_max_borrow=50,
+        log_level="WARNING",
+        secret_key="test-secret-b12",
+        library_name="测试图书馆",
+        admin_user=ADMIN_USER,
+        admin_password=ADMIN_PWD,
+        login_max_attempts=3,
+        login_lock_minutes=5,
+        cookie_secure=False,
+        # 只留惰性扫描，测试不起后台线程
+        sweep_interval_seconds=900,
+        upload_dir=str(b12_root / "uploads"),
+        # 减免 ≥ ¥5 走审批，让阈值开关在这批里真正被跑到
+        approval_waiver_threshold=5.0,
+        backup_dir=str(b12_root / "backups"),
+    )
+    b12_app = create_app(b12_cfg)
+    b12 = Api(b12_app.test_client())
+    b12.csrf = (
+        b12.post("/api/auth/login", json={"username": ADMIN_USER, "password": ADMIN_PWD}).get_json() or {}
+    ).get("csrf_token")
+
+    with b12_app.app_context():
+        b12_tables = {
+            row["name"] for row in db.query_all("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    b12_new_tables = {"job_runs", "outbound_messages", "approvals"}
+    check(
+        "新增三张表（调度留痕 / 邮件出站 / 审批工单）",
+        b12_new_tables <= b12_tables,
+        sorted(b12_new_tables - b12_tables),
+    )
+
+    def b12_member(card, name, *, email="", subscribed=1, mtype="学生"):
+        r = b12.post(
+            "/api/members",
+            json={"card_no": card, "name": name, "member_type": mtype, "status": "active", "max_borrow": 50},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        member_id = int(r.get_json()["id"])
+        if email:
+            with b12_app.app_context():
+                db.execute(
+                    "UPDATE members SET email = ?, email_subscribed = ? WHERE id = ?",
+                    [email, int(subscribed), member_id],
+                )
+        return member_id
+
+    def b12_book(isbn, title, total=1):
+        r = b12.post(
+            "/api/books",
+            json={"isbn": isbn, "title": title, "category": "第12批", "total_copies": total},
+        )
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def b12_borrow(book_id, member_id):
+        r = b12.post("/api/loans/borrow", json={"book_id": book_id, "member_id": member_id})
+        assert r.status_code in (200, 201), r.get_json()
+        return int(r.get_json()["id"])
+
+    def b12_backdate(loan_id, days=10):
+        with b12_app.app_context():
+            db.execute(
+                "UPDATE loans SET due_at = datetime('now', 'localtime', ?) WHERE id = ?",
+                [f"-{int(days)} days", int(loan_id)],
+            )
+
+    def b12_make_xlsx(rows):
+        """构造一个最小可用的 xlsx（含 sharedStrings 与 workbook 关系文件）。"""
+        shared: list[str] = []
+        index_of: dict[str, int] = {}
+
+        def sid(text: str) -> int:
+            if text not in index_of:
+                index_of[text] = len(shared)
+                shared.append(text)
+            return index_of[text]
+
+        body = []
+        for r, row in enumerate(rows, start=1):
+            cells = []
+            for c, value in enumerate(row):
+                ref = f"{chr(ord('A') + c)}{r}"
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+                else:
+                    cells.append(f'<c r="{ref}" t="s"><v>{sid(str(value))}</v></c>')
+            body.append(f'<row r="{r}">{"".join(cells)}</row>')
+        shared_xml = "".join(f"<si><t>{text}</t></si>" for text in shared)
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(body)}</sheetData></worksheet>'
+        )
+        shared_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"{shared_xml}</sst>"
+        )
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        )
+        rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet1.xml"/></Relationships>'
+        )
+        buffer = b12_io.BytesIO()
+        with b12_zip.ZipFile(buffer, "w", b12_zip.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("xl/workbook.xml", workbook_xml)
+            zf.writestr("xl/_rels/workbook.xml.rels", rels_xml)
+            zf.writestr("xl/sharedStrings.xml", shared_xml)
+            zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        return buffer.getvalue()
+
+    # 读能力真正生效：临时把馆员角色的**读能力抽掉**（只留写），读接口必须 403 而不是"登录即全读"。
+    # （数据库对 role 有 CHECK 约束，塞不进未知角色，所以直接改内存里的能力映射表再还原。）
+    b12_saved_librarian = b12_perm.ROLE_CAPABILITIES["librarian"]
+    b12_perm.ROLE_CAPABILITIES["librarian"] = frozenset({"book:write", "member:write"})
+    try:
+        only_write = librarian_client(b12_app, username="smoke-lr-read", password="librarian123")
+        read_denied = only_write.get("/api/books")
+        overview_denied = only_write.get("/api/dashboard/overview")
+    finally:
+        b12_perm.ROLE_CAPABILITIES["librarian"] = b12_saved_librarian
+    check(
+        "抽掉读能力后，后台读接口被 403 拦下（读能力声明真正生效）",
+        read_denied.status_code == 403
+        and "查看图书与馆藏" in read_denied.get_json()["error"]["message"],
+        read_denied.get_json(),
+    )
+    check("概览接口同受读能力保护", overview_denied.status_code == 403)
+    restored_lib = librarian_client(b12_app, username="smoke-lr-read", password="librarian123")
+    check(
+        "能力还原后馆员读接口恢复正常（日常业务不受影响）",
+        restored_lib.get("/api/books").status_code == 200
+        and restored_lib.get("/api/dashboard/overview").status_code == 200,
+    )
+    check("未登录访问后台读接口被 401 拦下", Api(b12_app.test_client()).get("/api/books").status_code == 401)
+    check(
+        "权限不足的尝试进了操作日志（状态=已拦截）",
+        with_ctx(
+            b12_app,
+            lambda: db.query_one(
+                "SELECT COUNT(*) AS n FROM operation_logs WHERE action = 'permission.denied' AND status = 'denied'"
+            )["n"],
+        )
+        >= 2,
+    )
+
+    # ---- 34.2 备份与恢复 ----
+    backup_res = b12.post("/api/system/backups", json={"with_uploads": False})
+    backup_json = backup_res.get_json() or {}
+    check(
+        "管理员可在后台触发备份，拿到文件名与数据量摘要",
+        backup_res.status_code == 200
+        and backup_json.get("name", "").endswith(".db")
+        and backup_json.get("counts", {}).get("admins", 0) >= 1,
+        backup_json,
+    )
+    listed = b12.get("/api/system/backups").get_json()
+    check(
+        "备份列表包含刚生成的备份",
+        any(item["name"] == backup_json.get("name") for item in listed["items"]),
+        [item["name"] for item in listed.get("items", [])],
+    )
+    downloaded = b12.get(f"/api/system/backups/{backup_json['name']}")
+    check(
+        "备份文件可下载且是合法 SQLite（按头部魔数校验）",
+        downloaded.status_code == 200 and downloaded.get_data()[:16] == b"SQLite format 3\x00",
+        downloaded.headers.get("Content-Disposition"),
+    )
+    check(
+        "备份下载做路径穿越校验（返 404 而不是吐文件）",
+        b12.get("/api/system/backups/..%2F..%2Fapp.py").status_code == 404,
+    )
+    zip_backup = b12.post("/api/system/backups", json={"with_uploads": True}).get_json()
+    check(
+        "可选择「连附件一起打包」生成 zip（内含数据库）",
+        str(zip_backup.get("name", "")).endswith(".zip") and zip_backup.get("with_uploads") is True,
+        zip_backup,
+    )
+    check(
+        "恢复只接受合法 SQLite 文件（假文件被拒，且不会动目标库）",
+        _b12_fake_restore_rejected(b12_root),
+    )
+    # 真恢复：把备份还原到一个**独立临时库**（不动正在跑的库），验证整条链路
+    b12_restore_cfg = Config(
+        db_path=str(b12_root / "restored" / "r.db"),
+        host="127.0.0.1",
+        port=8000,
+        debug=False,
+        loan_days=30,
+        max_renew=2,
+        fine_per_day=0.5,
+        default_max_borrow=5,
+        log_level="WARNING",
+        secret_key="t",
+        admin_user=ADMIN_USER,
+        admin_password=ADMIN_PWD,
+        backup_dir=str(b12_root / "backups"),
+    )
+    saved_cfg = b12_get_config()
+    try:
+        b12_set_config(b12_restore_cfg)
+        restored = b12_backup.restore_backup(Path(backup_json["path"]))
+    finally:
+        b12_set_config(saved_cfg)
+    check(
+        "从备份恢复：目标库被写成备份内容并回报表行数",
+        Path(b12_restore_cfg.db_path).exists()
+        and restored["counts"]["admins"] >= 1
+        and set(restored["counts"]) == {"books", "members", "loans", "admins"},
+        restored.get("counts"),
+    )
+    check(
+        "恢复前会留一份安全副本（目标已存在时）",
+        _b12_restore_keeps_safety_copy(b12_root),
+    )
+    check(
+        "CLI 命令注册齐全（backup / restore 都能被解析）",
+        all(
+            getattr(b12_build_parser().parse_args(argv), "func", None) is not None
+            for argv in (["backup"], ["backup", "--list"], ["restore", "--from", "x.db"])
+        ),
+    )
+
+    # ---- 34.3 调度可观测（手工触发 + 留痕） ----
+    run_now = b12.post("/api/system/jobs/sweep/run", json={})
+    check(
+        "管理员可手动触发一轮后台任务并拿到五类计数",
+        run_now.status_code == 200
+        and set(run_now.get_json()["result"])
+        == {"expired_reservations", "members", "due_soon", "overdue", "mail"},
+        run_now.get_json(),
+    )
+    jobs = b12.get("/api/system/jobs").get_json()
+    check(
+        "手动触发写入 job_runs 且标注 kind=manual",
+        jobs["total_runs"] >= 1
+        and jobs["recent"][0]["kind"] == "manual"
+        and jobs["recent"][0]["kind_label"] == "手动触发",
+        jobs["recent"][:1],
+    )
+    check(
+        "调度卡片暴露间隔、开关状态与线程状态",
+        jobs["interval_seconds"] == 900 and jobs["enabled"] is True and jobs["thread_running"] is False,
+        (jobs["interval_seconds"], jobs["enabled"], jobs["thread_running"]),
+    )
+    auto_sweep = with_ctx(b12_app, b12_scheduler.run_once, kind="auto")
+    check("直接调用 run_once 也留痕（kind=auto）", isinstance(auto_sweep, dict) and "mail" in auto_sweep, auto_sweep)
+    check(
+        "未知任务名被 400 拦下",
+        b12.post("/api/system/jobs/nope/run", json={}).status_code == 400,
+    )
+    check(
+        "非系统管理员看不到系统维护接口（403）",
+        librarian_client(b12_app).get("/api/system/jobs").status_code == 403,
+    )
+
+    # ---- 34.4 邮件出站渠道 ----
+    from library.reader import service as b12_reader_service  # noqa: PLC0415
+    import config as b12_config  # noqa: PLC0415
+
+    no_mail_member = b12_member("B12M001", "无邮箱读者")
+    b12.post(f"/api/members/{no_mail_member}/notify", json={"title": "站内通知", "body": "没有邮箱"})
+    with b12_app.app_context():
+        queued_none = int(
+            db.query_one("SELECT COUNT(*) AS n FROM outbound_messages WHERE member_id = ?", [no_mail_member])["n"]
+        )
+        notif_none = int(
+            db.query_one("SELECT COUNT(*) AS n FROM notifications WHERE member_id = ?", [no_mail_member])["n"]
+        )
+    check("读者没填邮箱时邮件不入队，但站内通知照发", queued_none == 0 and notif_none >= 1, (queued_none, notif_none))
+
+    mail_member = b12_member("B12M002", "有邮箱读者", email="b12-reader@example.com")
+    mail_book = b12_book("9787120000011", "邮件链路测试书", 1)
+    mail_loan = b12_borrow(mail_book, mail_member)
+    b12_backdate(mail_loan, 5)
+    with_ctx(b12_app, b12_scheduler.run_once, kind="auto")
+    with b12_app.app_context():
+        queued_rows = [dict(r) for r in db.query_all("SELECT * FROM outbound_messages WHERE member_id = ?", [mail_member])]
+    check(
+        "逾期扫描同时把邮件入队（站内 + 邮件双通道）",
+        len(queued_rows) == 1
+        and queued_rows[0]["status"] == "pending"
+        and queued_rows[0]["to_address"] == "b12-reader@example.com"
+        and "应还日期" in queued_rows[0]["body"],
+        queued_rows,
+    )
+    with_ctx(b12_app, b12_scheduler.run_once, kind="auto")
+    with b12_app.app_context():
+        queued_again = int(
+            db.query_one("SELECT COUNT(*) AS n FROM outbound_messages WHERE member_id = ?", [mail_member])["n"]
+        )
+    check("重复扫描不重复入队（沿用通知的 dedupe_key 幂等）", queued_again == 1, queued_again)
+
+    mail_status = b12.get("/api/system/mail").get_json()
+    check(
+        "渠道卡片暴露配置状态与队列统计（未配置时明确标注）",
+        mail_status["configured"] is False
+        and mail_status["counts"]["pending"] >= 1
+        and mail_status["counts"]["sent"] == 0
+        and mail_status["status_labels"]["pending"] == "待发送",
+        mail_status["counts"],
+    )
+    test_mail = b12.post("/api/system/mail/test", json={"to": "ops@example.com"})
+    check(
+        "未配置 SMTP 时发测试邮件被 422 拦下并说明缺什么",
+        test_mail.status_code == 422 and "SMTP" in test_mail.get_json()["error"]["message"],
+        test_mail.get_json(),
+    )
+    check("测试邮件缺收件人时 400（先校验再连服务器）", b12.post("/api/system/mail/test", json={}).status_code == 400)
+
+    with b12_app.app_context():
+        db.execute("UPDATE outbound_messages SET status = 'failed', attempts = 5 WHERE member_id = ?", [mail_member])
+    retried = b12.post("/api/system/mail/retry", json={}).get_json()
+    check(
+        "一键把发送失败的邮件重置回队列",
+        retried["reset"] == 1 and retried["status"]["counts"]["pending"] >= 1,
+        retried["reset"],
+    )
+
+    with b12_app.app_context():
+        db.execute("UPDATE members SET email_subscribed = 0 WHERE id = ?", [mail_member])
+        db.execute("DELETE FROM notifications WHERE member_id = ?", [mail_member])
+    with_ctx(b12_app, b12_scheduler.run_once, kind="auto")
+    with b12_app.app_context():
+        after_unsub = int(
+            db.query_one("SELECT COUNT(*) AS n FROM outbound_messages WHERE member_id = ?", [mail_member])["n"]
+        )
+    check("读者退订邮件后不再入队（站内通知仍照发）", after_unsub == 1, after_unsub)
+    check(
+        "读者资料里带邮件订阅开关（默认开启）",
+        with_ctx(
+            b12_app,
+            lambda: b12_reader_service.public_member(
+                db.query_one("SELECT * FROM members WHERE id = ?", [no_mail_member])
+            ),
+        )["email_subscribed"]
+        is True,
+    )
+
+    # 退订必须**走一遍读者接口再读回来**。只改库、只断言库里的那行，会漏掉「接口回显」
+    # 这一段：本批就真栽过一次——public_member 的列清单漏了 email_subscribed，
+    # 于是库已退订、接口仍回显 true、页面开关自动又勾回去，读者以为没生效。
+    from library.auth import passwords as b12_passwords  # noqa: PLC0415
+
+    sub_card = "B12M004"
+    sub_member = b12_member(sub_card, "订阅开关读者", email="b12-sub@example.com")
+    with b12_app.app_context():
+        db.execute(
+            "UPDATE members SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+            [b12_passwords.hash_password("sub123456"), sub_member],
+        )
+    sub_client = Api(b12_app.test_client())
+    sub_login = sub_client.post(
+        "/api/reader/login", json={"account": sub_card, "password": "sub123456"}
+    ).get_json() or {}
+    sub_client.csrf = sub_login.get("csrf_token")
+    check(
+        "读者本人可见资料里带订阅开关（默认开启）",
+        ((sub_client.get("/api/reader/me").get_json() or {}).get("member") or {}).get("email_subscribed")
+        is True,
+    )
+    off = sub_client.put(
+        "/api/reader/profile",
+        json={"phone": "", "email": "b12-sub@example.com", "email_subscribed": False},
+    ).get_json() or {}
+    check("读者关闭邮件订阅后，接口当场回显为已关闭", off.get("email_subscribed") is False, off.get("email_subscribed"))
+    check(
+        "重新拉 /api/reader/me 仍是已关闭（不是只在本次响应里改了）",
+        ((sub_client.get("/api/reader/me").get_json() or {}).get("member") or {}).get("email_subscribed")
+        is False,
+    )
+    with b12_app.app_context():
+        check(
+            "退订确实落到了库里（email_subscribed = 0）",
+            int(db.query_one("SELECT email_subscribed FROM members WHERE id = ?", [sub_member])["email_subscribed"])
+            == 0,
+        )
+
+    # ---- 34.5 审批流（阈值 ¥5） ----
+    ap_member = b12_member("B12M003", "审批测试读者")
+    ap_book = b12_book("9787120000021", "审批测试书", 1)
+    ap_loan = b12_borrow(ap_book, ap_member)
+    b12_backdate(ap_loan, 30)
+    owed = b12.get(f"/api/fines/member/{ap_member}").get_json()
+    check("逾期 30 天按统一口径算出应缴 ¥15", owed["total_outstanding"] == 15.0, owed)
+
+    below = b12.post("/api/fines/waive", json={"member_id": ap_member, "loan_id": ap_loan, "amount": 1, "note": "小额减免"})
+    check(
+        "低于阈值的减免直接生效（不启用审批的老路径保持原样）",
+        below.status_code == 200 and below.get_json()["kind"] == "waiver" and "status" not in below.get_json(),
+        below.get_json(),
+    )
+    over = b12.post("/api/fines/waive", json={"member_id": ap_member, "loan_id": ap_loan, "amount": 14, "note": "金额较大"})
+    over_json = over.get_json() or {}
+    check(
+        "达到阈值的减免不生效，转为待审批工单",
+        over.status_code == 200
+        and over_json.get("status") == "pending_approval"
+        and over_json.get("approval_id")
+        and over_json.get("threshold") == 5.0,
+        over_json,
+    )
+    left = b12.get(f"/api/fines/member/{ap_member}").get_json()
+    check("提交审批期间罚金一分未减（业务数据零改动）", left["total_outstanding"] == 14.0, left["total_outstanding"])
+
+    with b12_app.app_context():
+        admin_display = db.query_one("SELECT display_name FROM admins WHERE username = ?", [ADMIN_USER])["display_name"]
+    pend = b12.get("/api/approvals").get_json()
+    check(
+        "审批中心列出待审批工单且描述可读",
+        pend["total"] >= 1
+        and pend["items"][0]["status"] == "pending"
+        and "减免" in pend["items"][0]["entity_label"]
+        # 留痕记的是操作人**显示名**（不是登录名）——审计里给人看的是名字
+        and pend["items"][0]["requested_by"] == admin_display
+        # 分页组件读 payload.pages，漏了会渲染成「第 1/undefined 页」
+        and pend.get("pages") == max(1, -(-pend["total"] // pend["page_size"])),
+        pend["items"][:1],
+    )
+    check(
+        "待审批角标与列表口径一致",
+        b12.get("/api/approvals/pending-count").get_json()["pending"] == pend["pending"],
+    )
+    approval_id = int(over_json["approval_id"])
+    check("驳回必须填写审批意见（400）", b12.post(f"/api/approvals/{approval_id}/reject", json={}).status_code == 400)
+    check(
+        "未知工单号 404",
+        b12.post("/api/approvals/999999/approve", json={}).status_code == 404,
+    )
+    approved = b12.post(f"/api/approvals/{approval_id}/approve", json={"review_note": "情况属实，同意"})
+    check(
+        "审批通过后立即执行减免并回报金额",
+        approved.status_code == 200
+        and approved.get_json()["status"] == "approved"
+        and approved.get_json()["waived_amount"] == 14.0,
+        approved.get_json(),
+    )
+    check(
+        "减免后该笔已结清（待缴归零）",
+        b12.get(f"/api/fines/member/{ap_member}").get_json()["total_outstanding"] == 0.0,
+    )
+    check(
+        "已完成的工单不能重复处理（409）",
+        b12.post(f"/api/approvals/{approval_id}/approve", json={}).status_code == 409,
+    )
+    check("馆员无权查看审批中心（403）", librarian_client(b12_app).get("/api/approvals").status_code == 403)
+    check(
+        "工单里留住了申请理由与审批意见",
+        b12.get(f"/api/approvals?status=approved").get_json()["items"][0]["review_note"] == "情况属实，同意",
+    )
+
+    # ---- 34.6 xlsx 导入（零依赖解析） ----
+    xlsx_bytes = b12_make_xlsx(
+        [
+            ["书名", "ISBN", "作者", "总册数"],
+            ["Excel 导入测试书", "9787120000031", "某人", 2],
+            ["Excel 第二本", "9787120000032", "另一人", 1],
+        ]
+    )
+    xlsx_b64 = b12_b64.b64encode(xlsx_bytes).decode()
+    preview = b12.post("/api/import/books", json={"xlsx": xlsx_b64, "dry_run": True})
+    preview_json = preview.get_json() or {}
+    check(
+        "上传 xlsx：解开成行并逐行校验（预览不写库）",
+        preview.status_code == 200 and preview_json["total"] == 2 and preview_json["ok"] is True,
+        preview_json,
+    )
+    check(
+        "预览确实没写库",
+        b12.get("/api/books", query_string={"keyword": "Excel 导入测试书"}).get_json()["total"] == 0,
+    )
+    real = b12.post("/api/import/books", json={"xlsx": xlsx_b64})
+    check(
+        "xlsx 正式导入建目成功",
+        real.get_json()["created"] == 2 and real.get_json()["failed"] == 0,
+        real.get_json(),
+    )
+    check(
+        "导入后的书目可检索到",
+        b12.get("/api/books", query_string={"keyword": "Excel 导入测试书"}).get_json()["total"] == 1,
+    )
+    bad_b64 = b12.post("/api/import/books", json={"xlsx": "not-base64!!!", "dry_run": True})
+    check(
+        "非法 base64 被 400 拦下并指明字段",
+        bad_b64.status_code == 400 and bad_b64.get_json()["error"]["details"]["field"] == "xlsx",
+        bad_b64.get_json(),
+    )
+    broken_zip = b12.post(
+        "/api/import/books",
+        json={"xlsx": b12_b64.b64encode(b"PK\x03\x04broken payload").decode(), "dry_run": True},
+    )
+    check("PK 头但不是有效 xlsx 被 400 拦下", broken_zip.status_code == 400, broken_zip.get_json())
+    not_zip = b12.post(
+        "/api/import/books",
+        json={"xlsx": b12_b64.b64encode(b"legacy xls binary content").decode(), "dry_run": True},
+    )
+    check(
+        "上传旧版 .xls 时提示另存为 .xlsx",
+        not_zip.status_code == 400 and ".xlsx" in not_zip.get_json()["error"]["message"],
+        not_zip.get_json(),
+    )
+    parsed = b12_xlsx.parse_xlsx(b12_make_xlsx([["列一", "列二"], [2020.0, "文本"]]))
+    check("xlsx 解析：整数型浮点去尾（2020.0 → 2020）、文本保真", parsed[1] == ["2020", "文本"], parsed)
+    sparse = b12_xlsx.parse_xlsx(b12_make_xlsx([["a"], ["", "b"], ["c", "d"]]))
+    check("xlsx 解析：稀疏行按列回填（缺列补空）", sparse[1] == ["", "b"], sparse)
+    check("xlsx 解析：尾部的全空行被丢掉", len(b12_xlsx.parse_xlsx(b12_make_xlsx([["x"], ["", " "]]))) == 1)
+    check(
+        "非 zip 内容不会被误判成 xlsx",
+        b12_xlsx.looks_like_xlsx(b"hello") is False and b12_xlsx.looks_like_xlsx(b"PK\x03\x04") is True,
+    )
+
+    # ---- 34.7 新增配置项 ----
+    with b11_env(
+        LIBRARY_SMTP_HOST="smtp.example.com",
+        LIBRARY_SMTP_PORT="465",
+        LIBRARY_SMTP_SECURE="SSL",
+        LIBRARY_APPROVAL_WAIVER_THRESHOLD="20",
+        LIBRARY_BACKUP_DIR=str(b12_root / "bk"),
+    ):
+        loaded12 = b12_config.load_config()
+    check(
+        "邮件 / 审批 / 备份配置可从环境变量读取",
+        loaded12.smtp_host == "smtp.example.com"
+        and loaded12.smtp_port == 465
+        and loaded12.smtp_secure == "ssl"
+        and loaded12.approval_waiver_threshold == 20.0
+        and loaded12.backup_dir.endswith("bk"),
+        (loaded12.smtp_host, loaded12.smtp_port, loaded12.smtp_secure, loaded12.approval_waiver_threshold),
+    )
+    check("SMTP 未配置时默认为空（出站队列照常入队但不投递）", b12_config.load_config().smtp_host == "")
+    with b11_env(LIBRARY_SMTP_SECURE="starttls"):
+        check("SMTP 加密方式非法时拒绝启动", config_rejected(b12_config))
+    with b11_env(LIBRARY_APPROVAL_WAIVER_THRESHOLD="-1"):
+        check("审批阈值不能为负数", config_rejected(b12_config))
+    env12 = (root_res / ".env.example").read_text(encoding="utf-8")
+    check(
+        ".env.example 补齐第 12 批配置项",
+        all(
+            x in env12
+            for x in (
+                "LIBRARY_SMTP_HOST",
+                "LIBRARY_SMTP_PORT",
+                "LIBRARY_SMTP_USER",
+                "LIBRARY_SMTP_PASSWORD",
+                "LIBRARY_SMTP_FROM",
+                "LIBRARY_SMTP_SECURE",
+                "LIBRARY_APPROVAL_WAIVER_THRESHOLD",
+                "LIBRARY_BACKUP_DIR",
+            )
+        ),
+    )
+
+    # ---- 34.8 前端契约 ----
+    check(
+        "后台新增「审批中心」「系统维护」入口与视图",
+        all(
+            x in html_admin
+            for x in (
+                'data-view="approvals"',
+                'data-view="system"',
+                'id="view-approvals"',
+                'id="view-system"',
+                'id="approvalTable"',
+                'id="jobTable"',
+                'id="mailTable"',
+                'id="backupTable"',
+                'id="approvalBadge"',
+            )
+        ),
+    )
+    check(
+        "前端脚本含审批 / 系统维护 / 备份 / 邮件四组函数",
+        all(
+            x in js_admin
+            for x in (
+                "loadApprovals",
+                "openApprovalReview",
+                "refreshApprovalBadge",
+                "loadSystemJobs",
+                "runJobNow",
+                "loadSystemMail",
+                "sendTestMail",
+                "retryFailedMail",
+                "loadSystemBackups",
+                "createBackup",
+                "downloadBackup",
+            )
+        ),
+    )
+    check(
+        "审批空态文案按当前筛选条件判断（不看响应体里没有的字段）",
+        'state.approvals.status === "pending" ? "没有待审批的工单"' in js_admin,
+    )
+    check(
+        "导入页支持 .xlsx（accept + base64 提交 + 载入提示）",
+        'accept=".csv,.txt,.xlsx' in html_admin
+        and "state.imports.xlsx" in js_admin
+        and "readAsDataURL" in js_admin,
+    )
+    check("减免转审批时前端提示等待审批", "pending_approval" in js_admin)
+    check(
+        "读者端有邮件订阅开关并随资料一起提交",
+        'id="pEmailSubscribed"' in html_reader and "email_subscribed" in js_reader,
+    )
+    check(
+        "系统维护页样式齐备（汇总卡 / 提示条复用既有类）",
+        all(x in css_admin for x in (".sum-grid", ".import-tip", ".badge.info")),
+    )
+
+    # ==================== 第 12 批结束 ====================
+
+    env_example = (root_res / ".env.example").read_text(encoding="utf-8")
+    check(
+        ".env.example 补齐新增配置项",
+        all(
+            x in env_example
+            for x in ("LIBRARY_SWEEP_INTERVAL_SECONDS", "LIBRARY_UPLOAD_DIR", "LIBRARY_UPLOAD_MAX_MB")
+        ),
     )
 
     print(f"\n{'=' * 46}\n结果：{PASSED} 项通过，{FAILED} 项失败\n{'=' * 46}")

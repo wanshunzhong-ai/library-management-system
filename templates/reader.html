@@ -8,7 +8,40 @@
   <link rel="stylesheet" href="/static/css/site.css" />
   <link rel="stylesheet" href="/static/css/reader.css" />
 </head>
-<body class="reader-body">
+<body class="reader-body" data-library="{{ library_name }}">
+  <!-- 首次登录强制改密：遮罩不可关闭，也不提供跳过 -->
+  <div class="pw-gate" id="pwGate" hidden>
+    <div class="pw-gate-card" role="dialog" aria-modal="true" aria-labelledby="pwGateTitle">
+      <div class="pg-badge">安全提醒</div>
+      <h2 id="pwGateTitle">请先设置你自己的密码</h2>
+      <p class="pg-lead">
+        你的账号目前使用的是<strong>初始密码</strong>（借书证号后 6 位）。证号是可以被外人看到的编号，
+        所以初始密码约等于公开信息——在改掉它之前，其它功能暂不可用。
+      </p>
+      <form id="pwGateForm" novalidate>
+        <div class="field full" id="fieldGateOld">
+          <label for="gateOld">当前密码<span class="req">*</span></label>
+          <input id="gateOld" type="password" autocomplete="current-password" />
+          <span class="field-error" hidden></span>
+        </div>
+        <div class="field full" id="fieldGateNew">
+          <label for="gateNew">新密码<span class="req">*</span></label>
+          <input id="gateNew" type="password" autocomplete="new-password" placeholder="至少 6 位，不要用证的尾号" />
+          <span class="field-error" hidden></span>
+        </div>
+        <div class="field full" id="fieldGateNew2">
+          <label for="gateNew2">确认新密码<span class="req">*</span></label>
+          <input id="gateNew2" type="password" autocomplete="new-password" />
+          <span class="field-error" hidden></span>
+        </div>
+        <div class="field full">
+          <button class="btn btn-primary" type="submit" id="gateBtn">设置新密码并继续</button>
+        </div>
+      </form>
+      <button class="pg-logout" type="button" id="gateLogout">退出登录</button>
+    </div>
+  </div>
+
   <header class="reader-head">
     <div class="wrap reader-head-inner">
       <a class="brand" href="/">
@@ -20,9 +53,15 @@
       </a>
       <nav class="reader-nav">
         <a href="/">门户首页</a>
-        <a href="/#search">馆藏检索</a>
+        <a href="#sec-loans">我的借阅</a>
+        <a href="#sec-bookshelf">我的书架</a>
+        <a href="#sec-card">电子借书证</a>
       </nav>
       <div class="reader-me">
+        <button class="bell-btn" type="button" id="bellBtn" aria-label="消息中心">
+          <span class="bell-ico" aria-hidden="true">🔔</span>
+          <span class="bell-badge" id="bellBadge" hidden>0</span>
+        </button>
         <span class="me-name" id="headName">—</span>
         <span class="me-card" id="headCard">—</span>
         <button class="btn btn-outline btn-mini" id="logoutBtn" type="button">退出登录</button>
@@ -59,7 +98,7 @@
 
     <section class="stat-grid" id="statGrid"></section>
 
-    <section class="card reader-panel">
+    <section class="card reader-panel" id="sec-loans">
       <div class="panel-head">
         <h2>我的借阅</h2>
         <span class="sub" id="loanSummary"></span>
@@ -69,6 +108,7 @@
           <button class="tab" data-status="overdue" type="button">逾期</button>
           <button class="tab" data-status="returned" type="button">已归还</button>
         </div>
+        <button class="btn btn-outline btn-mini" type="button" id="exportLoansBtn">导出 CSV</button>
       </div>
       <div class="table-scroll">
         <table class="table">
@@ -89,10 +129,11 @@
     </section>
 
     <section class="reader-cols">
-      <div class="card reader-panel">
+      <div class="card reader-panel" id="sec-reservations">
         <div class="panel-head">
           <h2>我的预约</h2>
           <span class="sub" id="reservationSummary">—</span>
+          <button class="btn btn-outline btn-mini" type="button" id="exportResBtn">导出 CSV</button>
         </div>
         <div class="table-scroll">
           <table class="table">
@@ -124,10 +165,70 @@
       </div>
     </section>
 
-    <section class="card reader-panel">
+    <section class="card reader-panel" id="sec-notifications">
+      <div class="panel-head">
+        <h2>消息中心</h2>
+        <span class="sub" id="notifySummary">—</span>
+        <div class="tabs" id="notifyTabs">
+          <button class="tab is-active" data-kind="all" type="button">全部</button>
+          <button class="tab" data-kind="reservation_ready" type="button">预约到书</button>
+          <button class="tab" data-kind="due_soon" type="button">即将到期</button>
+          <button class="tab" data-kind="overdue" type="button">逾期</button>
+          <button class="tab" data-kind="fine" type="button">滞纳金</button>
+          <button class="tab" data-kind="profile" type="button">资料变更</button>
+          <button class="tab" data-kind="book_request" type="button">荐购处理</button>
+          <button class="tab" data-kind="system" type="button">馆员通知</button>
+        </div>
+        <button class="btn btn-outline btn-mini" type="button" id="readAllBtn">全部标记已读</button>
+      </div>
+      <div class="notify-list" id="notifyList"></div>
+      <div class="pager" id="notifyPager"></div>
+      <div class="panel-note">
+        站内消息在打开页面或消息中心时按需汇总（到书、逾期、到期前提醒、审核结果）。
+        它们不会主动推送，建议到馆前后各看一次。
+      </div>
+    </section>
+
+    <section class="card reader-panel" id="sec-bookshelf">
+      <div class="panel-head">
+        <h2>我的书架</h2>
+        <span class="sub" id="shelfSummary">—</span>
+        <button class="btn btn-outline btn-mini" type="button" id="exportFavBtn">导出 CSV</button>
+      </div>
+      <div class="shelf-add">
+        <form id="shelfAddForm" novalidate>
+          <input id="shelfKeyword" type="text" placeholder="搜索想收藏的图书（书名 / 作者 / ISBN / 条码）" autocomplete="off" />
+          <button class="btn btn-outline" type="submit" id="shelfSearchBtn">搜索</button>
+        </form>
+        <div class="shelf-candidates" id="shelfCandidates"></div>
+      </div>
+      <div class="shelf-grid" id="shelfGrid"></div>
+      <div class="pager" id="shelfPager"></div>
+    </section>
+
+    <section class="reader-cols">
+      <div class="card reader-panel" id="sec-reviews">
+        <div class="panel-head">
+          <h2>待评价</h2>
+          <span class="sub" id="reviewableSummary">—</span>
+        </div>
+        <div class="reviewable-list" id="reviewableList"></div>
+      </div>
+
+      <div class="card reader-panel">
+        <div class="panel-head">
+          <h2>我的评价</h2>
+          <span class="sub" id="myReviewSummary">—</span>
+        </div>
+        <div class="my-review-list" id="myReviewList"></div>
+      </div>
+    </section>
+
+    <section class="card reader-panel" id="sec-fines">
       <div class="panel-head">
         <h2>滞纳金</h2>
         <span class="sub" id="fineSummary">—</span>
+        <button class="btn btn-outline btn-mini" type="button" id="exportFineBtn">导出 CSV</button>
         <button class="btn btn-primary btn-mini" type="button" id="payAllBtn" hidden>一次结清</button>
       </div>
       <div class="table-scroll">
@@ -150,7 +251,109 @@
     </section>
 
     <section class="reader-cols">
-      <div class="card reader-panel">
+      <div class="card reader-panel" id="sec-requests">
+        <div class="panel-head">
+          <h2>荐购登记</h2>
+          <span class="sub" id="bookRequestSummary">—</span>
+        </div>
+        <form class="form-grid" id="bookRequestForm" novalidate>
+          <div class="field full" id="fieldBrTitle">
+            <label for="brTitle">书名<span class="req">*</span></label>
+            <input id="brTitle" type="text" placeholder="希望图书馆采购的书名" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field" id="fieldBrAuthor">
+            <label for="brAuthor">作者</label>
+            <input id="brAuthor" type="text" placeholder="选填" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field" id="fieldBrPublisher">
+            <label for="brPublisher">出版社</label>
+            <input id="brPublisher" type="text" placeholder="选填" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field" id="fieldBrIsbn">
+            <label for="brIsbn">ISBN</label>
+            <input id="brIsbn" type="text" placeholder="选填" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full" id="fieldBrReason">
+            <label for="brReason">荐购理由</label>
+            <textarea id="brReason" rows="2" placeholder="为什么推荐这本书（选填）"></textarea>
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full">
+            <button class="btn btn-primary" type="submit" id="bookRequestBtn">提交荐购</button>
+          </div>
+        </form>
+        <div class="request-list" id="bookRequestList"></div>
+      </div>
+
+      <div class="card reader-panel" id="sec-profile-requests">
+        <div class="panel-head">
+          <h2>资料变更申请</h2>
+          <span class="sub">姓名与读者类型需馆员审核</span>
+        </div>
+        <form class="form-grid" id="profileRequestForm" novalidate>
+          <div class="field" id="fieldPrField">
+            <label for="prField">变更项<span class="req">*</span></label>
+            <select id="prField"></select>
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field" id="fieldPrValue">
+            <label for="prValue">新的值<span class="req">*</span></label>
+            <input id="prValue" type="text" placeholder="请输入要改成的内容" />
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full" id="fieldPrReason">
+            <label for="prReason">变更说明</label>
+            <textarea id="prReason" rows="2" placeholder="例如：改名（户口本已更新）"></textarea>
+            <span class="field-error" hidden></span>
+          </div>
+          <div class="field full">
+            <button class="btn btn-primary" type="submit" id="profileRequestBtn">提交申请</button>
+          </div>
+        </form>
+        <div class="panel-note" id="profileRequestNote">
+          联系电话不需要审批，直接在下方「个人资料」里改即可。
+        </div>
+        <div class="request-list" id="profileRequestList"></div>
+      </div>
+    </section>
+
+    <section class="card reader-panel" id="sec-card">
+      <div class="panel-head">
+        <h2>电子借书证</h2>
+        <span class="sub">到馆出示即可，无需携带实体证</span>
+        <button class="btn btn-outline btn-mini" type="button" id="printCardBtn">打印 / 保存</button>
+      </div>
+      <div class="e-card" id="eCard">
+        <div class="ec-head">
+          <div class="ec-lib">{{ library_name }}</div>
+          <div class="ec-kind">READER CARD</div>
+        </div>
+        <div class="ec-body">
+          <div class="ec-fields">
+            <div class="ec-field"><span>姓名</span><b id="ecName">—</b></div>
+            <div class="ec-field"><span>证号</span><b id="ecNo" class="mono">—</b></div>
+            <div class="ec-field"><span>类型</span><b id="ecType">—</b></div>
+            <div class="ec-field"><span>状态</span><b id="ecStatus">—</b></div>
+          </div>
+          <div class="ec-codes">
+            <div class="ec-qr" id="ecQr"></div>
+            <div class="ec-barcode" id="ecBarcode"></div>
+          </div>
+        </div>
+        <div class="ec-foot" id="ecFoot">馆员扫条码办借还，手机扫二维码可核对身份</div>
+      </div>
+      <div class="panel-note">
+        二维码内容为你的借书证号本身，不含姓名、手机号等其它个人信息；
+        截图或拍照时请留意周围环境。
+      </div>
+    </section>
+
+    <section class="reader-cols">
+      <div class="card reader-panel" id="sec-profile">
         <div class="panel-head">
           <h2>个人资料</h2>
           <span class="sub">姓名、证号与可借上限由馆员维护</span>
@@ -169,6 +372,10 @@
             <label for="pEmail">邮箱</label>
             <input id="pEmail" name="email" type="text" placeholder="选填" />
             <span class="field-error" hidden></span>
+          </div>
+          <div class="field full" id="fieldSubscribe">
+            <label class="check"><input type="checkbox" id="pEmailSubscribed" /> 接收邮件提醒（催还、到期、预约到书）</label>
+            <span class="tip">关闭后仍会在「消息中心」收到站内通知，只是不再发邮件；需先填写邮箱。</span>
           </div>
           <div class="field full">
             <button class="btn btn-primary" type="submit" id="profileBtn">保存联系方式</button>
@@ -207,6 +414,8 @@
   </main>
 
   <div class="toast-layer" id="toastLayer"></div>
+  <script src="/static/js/barcode.js"></script>
+  <script src="/static/js/qrcode.js"></script>
   <script src="/static/js/reader.js"></script>
 </body>
 </html>

@@ -187,11 +187,17 @@ def member_outstanding(member_id: int) -> dict[str, Any]:
 
 
 def settle(payload: Mapping[str, Any], *, kind: str, operator: str) -> dict[str, Any]:
-    """馆员代收（payment）或减免（waiver）。amount 缺省表示结清该笔全部应缴。"""
+    """馆员代收（payment）或减免（waiver）。amount 缺省表示结清该笔全部应缴。
+
+    **减免必须填写理由**——减免是「不收这笔钱」的权力，没有理由就成了口子；
+    前端也会为此弹一次确认框（把金额与理由摆在一起再确认一次）。
+    """
     member_id = _require_int(payload, "member_id", label="读者")
     loan_id = _require_int(payload, "loan_id", label="借阅记录")
     note = optional_str(payload, "note", label="备注", max_length=200)
     method = optional_str(payload, "method", label="方式", max_length=20) or ("cash" if kind == "payment" else "waive")
+    if kind == "waiver" and not note:
+        raise ValidationError("减免必须填写理由，便于事后核对", details={"field": "note"})
 
     with db.transaction(immediate=True) as conn:
         items = _outstanding_items(member_id)
@@ -212,18 +218,104 @@ def settle(payload: Mapping[str, Any], *, kind: str, operator: str) -> dict[str,
             if amount > owed + _EPSILON:
                 raise BusinessRuleError(f"金额不能超过该笔应缴 ¥{owed:.2f}")
 
-        cur = conn.execute(
-            "INSERT INTO fine_payments (member_id, loan_id, amount, kind, method, note, operator) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [member_id, loan_id, amount, kind, method, note, operator],
+        if kind == "waiver":
+            # 减免是「不收这笔钱」的权力，最容易被滥用：金额达到审批阈值时
+            # **不在此处生效**，而是落一张待审批工单（同一事务），由系统管理员批准。
+            # 默认阈值 0 = 不启用审批，行为与历史版本完全一致。
+            from library.approvals import service as approval_service  # noqa: PLC0415
+
+            deferred = approval_service.maybe_defer_waiver(
+                conn, member_id, loan_id, amount, note=note, operator=operator
+            )
+            if deferred is not None:
+                return deferred
+
+        repo.insert_payment_conn(
+            conn,
+            member_id=member_id,
+            loan_id=loan_id,
+            amount=amount,
+            kind=kind,
+            method=method,
+            note=note,
+            operator=operator,
         )
-        cur.close()
 
     logger.info(
         "馆员结算滞纳金",
         extra={"extra_fields": {"member_id": member_id, "loan_id": loan_id, "kind": kind, "amount": amount}},
     )
     return {"member_id": member_id, "loan_id": loan_id, "amount": amount, "kind": kind}
+
+
+def execute_approved_waiver(
+    conn, member_id: int, loan_id: int, amount: float, *, reason: str, operator: str
+) -> float:
+    """审批通过后执行减免（在**调用方事务内**），返回实际减免金额。
+
+    按「当前待缴」裁定：审批批的是金额上限，执行时若读者已自行缴掉一部分，
+    只免掉剩下的；若这笔已经结清，则抛业务错误让审批人看到（可驳回留档），
+    绝不凭空多写一笔减免。
+    """
+    items = _outstanding_items(int(member_id))
+    target = next((item for item in items if int(item["loan_id"]) == int(loan_id)), None)
+    if target is None:
+        raise BusinessRuleError("该笔滞纳金已结清或不存在，审批单无需执行")
+    owed = round(float(target["outstanding"]), 2)
+    actual = min(round(float(amount or 0), 2), owed)
+    if actual <= _EPSILON:
+        raise BusinessRuleError("该笔滞纳金已结清，审批单无需执行")
+    repo.insert_payment_conn(
+        conn,
+        member_id=int(member_id),
+        loan_id=int(loan_id),
+        amount=actual,
+        kind="waiver",
+        method="waive",
+        note=(reason or "审批减免")[:200],
+        operator=operator,
+    )
+    logger.info(
+        "审批通过执行减免",
+        extra={"extra_fields": {"member_id": member_id, "loan_id": loan_id, "amount": actual, "operator": operator}},
+    )
+    return actual
+
+
+def waive_for_loan(
+    conn, member_id: int, loan_id: int, *, reason: str, operator: str
+) -> float:
+    """在**调用方的事务内**把某笔借阅的全部待缴罚金一次减免，返回减免金额（0 = 无可减免）。
+
+    跨模块联动专用（「赔偿结案时同步免掉这笔逾期罚金」）：只用调用方的连接写入。
+    ``db.execute`` 自带事务，在外层 ``BEGIN IMMEDIATE`` 里调用会中途提交外层事务、
+    悄悄破坏原子性——赔偿结案与减免必须同时成功或同时不发生。
+
+    读取走 ``_outstanding_items``（内部用 ``db.query_all``，请求内复用同一连接），
+    因此看到的就是本事务内的最新数据。
+    """
+    items = _outstanding_items(int(member_id))
+    target = next((item for item in items if int(item["loan_id"]) == int(loan_id)), None)
+    if target is None:
+        return 0.0
+    owed = float(target["outstanding"])
+    if owed <= _EPSILON:
+        return 0.0
+    repo.insert_payment_conn(
+        conn,
+        member_id=int(member_id),
+        loan_id=int(loan_id),
+        amount=owed,
+        kind="waiver",
+        method="waive",
+        note=(reason or "图书赔偿结案")[:200],
+        operator=operator,
+    )
+    logger.info(
+        "赔偿结案同步减免滞纳金",
+        extra={"extra_fields": {"member_id": member_id, "loan_id": loan_id, "amount": owed}},
+    )
+    return round(owed, 2)
 
 
 def _require_int(payload: Mapping[str, Any], key: str, *, label: str) -> int:

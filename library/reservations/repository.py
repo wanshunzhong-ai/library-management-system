@@ -182,15 +182,56 @@ def mark_fulfilled(res_id: int) -> int:
 
 def close(res_id: int, status: str) -> int:
     """把未结束的预约置为 cancelled / expired。返回命中行数。"""
-    placeholders = ",".join("?" for _ in OPEN_STATUSES)
     with db.transaction() as conn:
-        cur = conn.execute(
-            "UPDATE reservations SET status = ?, "
-            "       closed_at = datetime('now', 'localtime'), "
-            "       updated_at = datetime('now', 'localtime') "
-            f" WHERE id = ? AND status IN ({placeholders})",
-            [status, res_id, *OPEN_STATUSES],
-        )
-        changed = max(0, int(cur.rowcount or 0))
-        cur.close()
+        changed = close_with(conn, res_id, status)
     return changed
+
+
+# ---------------------------------------------------------------- 事务内使用
+# 下面几个函数接收**调用方的事务连接**，自己不开事务。
+# 理由：`db.execute` / `db.transaction` 会自行提交，在外层 `BEGIN IMMEDIATE` 里
+# 调用会中途结束外层事务，把「关旧单 + 开新单」这类原子语义打散。
+
+
+def close_with(conn, res_id: int, status: str) -> int:
+    placeholders = ",".join("?" for _ in OPEN_STATUSES)
+    cur = conn.execute(
+        "UPDATE reservations SET status = ?, "
+        "       closed_at = datetime('now', 'localtime'), "
+        "       updated_at = datetime('now', 'localtime') "
+        f" WHERE id = ? AND status IN ({placeholders})",
+        [status, res_id, *OPEN_STATUSES],
+    )
+    changed = max(0, int(cur.rowcount or 0))
+    cur.close()
+    return changed
+
+
+def insert_with(conn, *, book_id: int, member_id: int, note: str = "") -> int:
+    cur = conn.execute(
+        "INSERT INTO reservations (book_id, member_id, status, note) VALUES (?, ?, 'waiting', ?)",
+        [book_id, member_id, note],
+    )
+    new_id = int(cur.lastrowid or 0)
+    cur.close()
+    return new_id
+
+
+def count_status(book_id: int, status: str) -> int:
+    return int(
+        db.query_scalar(
+            "SELECT COUNT(*) FROM reservations WHERE book_id = ? AND status = ?",
+            [book_id, status],
+        )
+        or 0
+    )
+
+
+def list_expired_ready(hold_days: int) -> list[dict[str, Any]]:
+    """已过取书保留期、仍未办理借出的「已到书」预约。"""
+    return db.query_all(
+        _SELECT + " WHERE r.status = 'ready' AND r.ready_at IS NOT NULL"
+        "   AND datetime(r.ready_at, ?) < datetime('now', 'localtime')"
+        " ORDER BY r.id",
+        [f"+{int(hold_days)} days"],
+    )

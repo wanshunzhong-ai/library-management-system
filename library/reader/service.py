@@ -47,6 +47,15 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # 读者端免登录接口（登录页与登录动作本身）
 PUBLIC_ENDPOINTS = {"reader.login_page", "reader.login"}
 
+# 「首次登录必须改密」闸门放行的最小集合。少一个就会把读者锁死在自己的账号外
+# （拿不到 CSRF token、看不到提示、连改密接口都进不去），多一个就等于闸门失效。
+PASSWORD_CHANGE_ALLOWED = {
+    ("GET", "/api/reader/me"),
+    ("GET", "/api/reader/notifications"),
+    ("POST", "/api/reader/password"),
+    ("POST", "/api/reader/logout"),
+}
+
 # 与管理员共用同一个限流器：登录入口统一，两套计数会给出绕过锁定的空子
 reader_throttle = login_throttle
 
@@ -62,11 +71,13 @@ def public_member(row: Mapping[str, Any]) -> dict[str, Any]:
         "name": row["name"],
         "phone": row["phone"],
         "email": row["email"],
+        "email_subscribed": bool(row.get("email_subscribed", 1)),
         "member_type": row["member_type"],
         "status": row["status"],
         "max_borrow": int(row["max_borrow"]),
         "card_lost": bool(row.get("card_lost")),
         "lost_at": row.get("lost_at"),
+        "must_change_password": bool(row.get("must_change_password")),
         "last_login_at": row.get("last_login_at"),
     }
 
@@ -194,6 +205,35 @@ def reader_required(view: Callable) -> Callable:
     return wrapper
 
 
+def password_change_gate():
+    """首次登录强制改密的闸门。返回响应表示拦截。
+
+    馆员建号 / 重置密码 / 办证发证后，口令是「证号后 6 位」——证号是顺序编号时
+    这几乎等于公开信息，所以必须让读者在真正使用账号前先换掉它。
+    拦截期间只放行 ``PASSWORD_CHANGE_ALLOWED`` 里的最小集合（页面初始化 + 改密本身）。
+    """
+    member = current_reader()
+    if member is None or not member.get("must_change_password"):
+        return None
+    if (request.method, request.path) in PASSWORD_CHANGE_ALLOWED:
+        return None
+    logger.info(
+        "截断未改初始密码的读者请求",
+        extra={"extra_fields": {"member_id": member["id"], "path": request.path}},
+    )
+    return (
+        jsonify(
+            {
+                "error": {
+                    "code": "password_change_required",
+                    "message": "这是初始密码，请先修改密码后再使用其他功能",
+                }
+            }
+        ),
+        403,
+    )
+
+
 # ---------------------------------------------------------------- 个人中心数据
 
 
@@ -244,12 +284,15 @@ def me() -> dict[str, Any]:
         "stats": stats(member),
         "reservations": _reservation_summary(member),
         "fines": _fine_summary(member),
+        "notifications": _notification_summary(member),
         "rules": {
             "loan_days": cfg.loan_days,
             "max_renew": cfg.max_renew,
             "fine_per_day": cfg.fine_per_day,
             "fine_max_days": cfg.fine_max_days,
             "fine_cap": cfg.fine_cap,
+            "reservation_hold_days": cfg.reservation_hold_days,
+            "notify_due_soon_days": cfg.notify_due_soon_days,
         },
         "library": {"name": cfg.library_name, "slogan": cfg.library_slogan},
         "csrf_token": csrf_token(),
@@ -276,6 +319,26 @@ def _fine_summary(member: Mapping[str, Any]) -> dict[str, Any]:
         "total_waived": overview["total_waived"],
         "item_count": len(overview["items"]),
     }
+
+
+def _notification_summary(member: Mapping[str, Any]) -> dict[str, Any]:
+    """未读通知数（顺带把该补的通知补上）。
+
+    系统没有定时任务，通知是在这里**惰性生成**的：读者每打开一次个人中心，
+    就复查一遍「有没有书马上要还、有没有已经逾期、有没有预约该取了」。
+    见 `library.notifications.service` 的模块注释。
+    """
+    from library.notifications import service as notification_service  # noqa: PLC0415
+    from library.reservations import service as reservation_service  # noqa: PLC0415
+
+    try:
+        reservation_service.sweep_expired()
+    except Exception:  # noqa: BLE001 - 概览页不该因为清理失败而打不开
+        logger.warning("预约超期清理失败（已忽略）", exc_info=True)
+
+    member_id = int(member["id"])
+    notification_service.sweep_member(member_id)
+    return {"unread": notification_service.unread_count(member_id)}
 
 
 def list_my_loans(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
@@ -320,16 +383,18 @@ def renew_my_loan(member: Mapping[str, Any], loan_id: int) -> dict[str, Any]:
 
 
 def update_profile(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
-    """读者自助维护联系方式；姓名 / 证号 / 可借上限仍由管理员掌握。"""
+    """读者自助维护联系方式与邮件订阅开关；姓名 / 证号 / 可借上限仍由管理员掌握。"""
     phone = optional_str(payload, "phone", label="手机号", max_length=20)
     email = optional_email(payload, "email")
+    subscribed = payload.get("email_subscribed")
+    subscribed_flag = None if subscribed is None or subscribed == "" else str(subscribed).strip().lower() in ("1", "true", "on", "yes")
 
     # 手机号可用于登录，必须与其它读者的证号 / 手机号以及管理员工号全局唯一
     member_service.ensure_identifier_available(
         phone, field="phone", label="手机号", exclude_member_id=int(member["id"])
     )
 
-    member_repo.update_contact(int(member["id"]), phone, email)
+    member_repo.update_contact(int(member["id"]), phone, email, email_subscribed=subscribed_flag)
     row = member_repo.get(int(member["id"])) or {}
     return public_member(row)
 
@@ -344,6 +409,8 @@ def change_password(member: Mapping[str, Any], old_password: str, new_password: 
         raise ValidationError("新密码不能与当前密码相同", details={"field": "new_password"})
 
     member_repo.update_password_hash(int(member["id"]), hash_password(new_password))
+    # 改密成功即解除「首次登录必须改密」——这是这道闸门唯一的出口
+    member_repo.set_must_change_password(int(member["id"]), False)
     logout()  # 改密后强制重新登录
     logger.info("读者修改密码", extra={"extra_fields": {"member_id": member["id"]}})
 
@@ -369,6 +436,15 @@ def cancel_reservation(member: Mapping[str, Any], res_id: int) -> dict[str, Any]
     return reservation_service.cancel_my_reservation(member, res_id)
 
 
+def rebook_reservation(
+    member: Mapping[str, Any], res_id: int, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """改约：把一条未结束的预约换到另一本书（关旧单 + 开新单在一个事务内）。"""
+    from library.reservations import service as reservation_service  # noqa: PLC0415
+
+    return reservation_service.rebook(member, res_id, payload)
+
+
 def search_books_for_reserve(query: Mapping[str, Any]) -> dict[str, Any]:
     """预约前的图书检索：复用门户检索口径，只返回可预约相关的馆藏信息。"""
     from library.books import service as book_service  # noqa: PLC0415
@@ -381,6 +457,89 @@ def search_books_for_reserve(query: Mapping[str, Any]) -> dict[str, Any]:
             "page_size": query.get("page_size", 8),
         }
     )
+
+
+# ---------------------------------------------------------------- 读者互动
+# 四个领域（收藏 / 评价 / 荐购 / 资料变更）的业务在 library.engagement，
+# 读者端只做「取会话中的 member_id → 转发」，与预约、滞纳金保持同一套写法。
+
+
+def list_my_favorites(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.list_my_favorites(member, query)
+
+
+def add_favorite(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.add_favorite(member, payload)
+
+
+def update_favorite(member: Mapping[str, Any], favorite_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.update_favorite(member, favorite_id, payload)
+
+
+def remove_favorite(member: Mapping[str, Any], favorite_id: int) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.remove_favorite(member, favorite_id)
+
+
+def list_my_reviews(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.list_my_reviews(member, query)
+
+
+def list_my_reviewable(member: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.list_reviewable(member)
+
+
+def submit_review(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.submit_review(member, payload)
+
+
+def delete_my_review(member: Mapping[str, Any], review_id: int) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.delete_my_review(member, review_id)
+
+
+def book_reviews(member: Mapping[str, Any], book_id: int, query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.book_reviews(book_id, query, member_id=int(member["id"]))
+
+
+def list_my_book_requests(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.list_my_book_requests(member, query)
+
+
+def submit_book_request(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.submit_book_request(member, payload)
+
+
+def list_my_profile_requests(member: Mapping[str, Any], query: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.list_my_profile_requests(member, query)
+
+
+def submit_profile_request(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    from library.engagement import service as engagement  # noqa: PLC0415
+
+    return engagement.submit_profile_request(member, payload)
 
 
 # ---------------------------------------------------------------- 滞纳金（读者侧）
@@ -400,6 +559,18 @@ def pay_fines(member: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str
         "读者自助缴纳滞纳金",
         extra={"extra_fields": {"member_id": member["id"], "amount": result.get("paid_total")}},
     )
+    try:
+        from library.notifications import service as notification_service  # noqa: PLC0415
+
+        notification_service.notify(
+            int(member["id"]),
+            "fine",
+            f"已登记缴纳滞纳金 ¥{float(result.get('paid_total') or 0):.2f}",
+            body=f"本次共 {int(result.get('count') or 0)} 笔。系统内为自助登记，如需纸质凭证请联系馆员。",
+            link_view="fines",
+        )
+    except Exception:  # noqa: BLE001 - 通知是增强功能
+        logger.warning("缴纳通知写入失败（已忽略）", exc_info=True)
     return result
 
 

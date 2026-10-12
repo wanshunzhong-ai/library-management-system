@@ -27,6 +27,10 @@
 
 * { box-sizing: border-box; }
 
+/* JS 用 el.hidden = true 控制显隐；但只要该元素被作者样式设过 display（如 .btn / .pw-gate），
+   UA 的 [hidden]{display:none} 就会被覆盖，「隐藏」的元素依旧画在页面上。这里统一兜底。 */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

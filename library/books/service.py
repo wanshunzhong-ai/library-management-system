@@ -74,6 +74,23 @@ def _allocate_barcode(book_id: int) -> str:
     raise ConflictError("条码号已用尽，请手工指定馆藏条码")
 
 
+def validate_book(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """只做规范化与唯一性校验，**不写库**（批量导入预览用）。
+
+    与 ``create_book`` 共用同一套 ``_normalize`` 与冲突判定，避免「预览说没问题、
+    真导入却报错」这种两套口径的经典坑。
+    """
+    data = _normalize(payload)
+    if repo.exists_isbn(data["isbn"]):
+        raise ConflictError(f"ISBN {data['isbn']} 已存在", details={"field": "isbn"})
+    if data["barcode"] and repo.exists_barcode(data["barcode"]):
+        raise ConflictError(
+            f"馆藏条码 {data['barcode']} 已被其它图书占用", details={"field": "barcode"}
+        )
+    data["isbn_check"] = isbn_check(data["isbn"])
+    return data
+
+
 def list_books(query: Mapping[str, Any]) -> dict[str, Any]:
     page, size = pagination(query)
     filters = {

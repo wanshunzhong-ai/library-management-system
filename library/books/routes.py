@@ -14,16 +14,19 @@ bp = Blueprint("books", __name__, url_prefix="/api/books")
 
 
 @bp.get("")
+@require_permission("book:read")
 def list_books():
     return jsonify(service.list_books(request.args.to_dict(flat=True)))
 
 
 @bp.get("/categories")
+@require_permission("book:read")
 def list_categories():
     return jsonify({"items": service.list_categories()})
 
 
 @bp.get("/<int:book_id>")
+@require_permission("book:read")
 def get_book(book_id: int):
     return jsonify(service.get_book(book_id))
 

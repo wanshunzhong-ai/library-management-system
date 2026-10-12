@@ -19,18 +19,20 @@ from library.reader import service as reader_service
 logger = logging.getLogger(__name__)
 
 
-def create_app(config: Config | None = None) -> Flask:
+def create_app(config: Config | None = None, *, with_scheduler: bool = False) -> Flask:
     if config is not None:
         set_config(config)
     cfg = config or get_config()
     init_logging(cfg.log_level)
 
+    # 上传接口要收图片 / PDF，2MB 的默认上限太紧；按配置放宽，并至少保留 2MB。
+    max_content = max(2, int(cfg.upload_max_mb) + 1) * 1024 * 1024
     app = Flask(__name__, template_folder="../templates", static_folder="../static")
     app.config.update(
         SECRET_KEY=cfg.secret_key,
         JSON_SORT_KEYS=False,
         JSON_AS_ASCII=False,
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=max_content,
         # ---- 会话 Cookie 安全 ----
         SESSION_COOKIE_NAME="library_session",
         SESSION_COOKIE_HTTPONLY=True,
@@ -64,6 +66,13 @@ def create_app(config: Config | None = None) -> Flask:
         except Exception:  # noqa: BLE001 - 回填属增强逻辑，不应拖垮启动
             logger.warning("演示简介回填失败，已跳过", exc_info=True)
 
+    if with_scheduler:
+        # 后台定时扫描（预约过期释放 + 到期/逾期提醒）。
+        # 只在真正的服务进程里启动：测试与嵌入式用法默认不起线程。
+        from library import scheduler  # noqa: PLC0415
+
+        scheduler.start(app)
+
     return app
 
 
@@ -84,26 +93,48 @@ def _warn_if_default_admin_password() -> None:
 
 def _register_blueprints(app: Flask) -> None:
     from library.accounts import bp as accounts_bp
+    from library.acquisitions import bp as acquisitions_bp
+    from library.announcements import bp as announcements_bp
+    from library.applications import bp as applications_bp
+    from library.approvals import bp as approvals_bp
     from library.auth import bp as auth_bp
     from library.books import bp as books_bp
+    from library.compensations import bp as compensations_bp
     from library.dashboard import bp as dashboard_bp
+    from library.engagement import bp as engagement_bp
     from library.fines import bp as fines_bp
+    from library.importer import bp as importer_bp
     from library.loans import bp as loans_bp
+    from library.memberfiles import bp as memberfiles_bp
     from library.members import bp as members_bp
+    from library.notifications import bp as notifications_bp
     from library.public import bp as public_bp
     from library.reader import bp as reader_bp
     from library.reservations import bp as reservations_bp
+    from library.stocktaking import bp as stocktaking_bp
+    from library.sysadmin import bp as sysadmin_bp
 
     app.register_blueprint(public_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(reader_bp)
+    app.register_blueprint(notifications_bp)
     app.register_blueprint(books_bp)
     app.register_blueprint(members_bp)
     app.register_blueprint(loans_bp)
     app.register_blueprint(reservations_bp)
     app.register_blueprint(fines_bp)
+    app.register_blueprint(announcements_bp)
+    app.register_blueprint(applications_bp)
+    app.register_blueprint(engagement_bp)
+    app.register_blueprint(compensations_bp)
+    app.register_blueprint(stocktaking_bp)
+    app.register_blueprint(acquisitions_bp)
+    app.register_blueprint(memberfiles_bp)
+    app.register_blueprint(importer_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(accounts_bp)
+    app.register_blueprint(approvals_bp)
+    app.register_blueprint(sysadmin_bp)
 
 
 def _register_guard(app: Flask) -> None:
@@ -134,6 +165,11 @@ def _register_guard(app: Flask) -> None:
                     jsonify({"error": {"code": "unauthorized", "message": "请先登录读者账号"}}),
                     401,
                 )
+            # 仍在使用初始密码时先逼它改掉，否则「证号后 6 位」这种可猜解的口令
+            # 会长期有效。改密接口本身与页面初始化所需的几个接口放行。
+            blocked = reader_service.password_change_gate()
+            if blocked is not None:
+                return blocked
             return reader_service.csrf_protect()
 
         if path.startswith(public_prefixes) or endpoint in public_endpoints:
